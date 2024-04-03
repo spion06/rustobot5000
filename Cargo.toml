@@ -1,0 +1,28 @@
+[package]
+name = "rustobot5000"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.81"
+bitflags = "2.4.2"
+crc32fast = "1.4.0"
+derive_more = "0.99.17"
+gstreamer = { version = "0.22.2", features = ["v1_20"] }
+gstreamer-audio = { version = "0.22.0", features = ["v1_20"] }
+gstreamer-pbutils = { version = "0.22.0", features = ["v1_20"] }
+gstreamer-video = { version = "0.22.1", features = ["v1_20"] }
+k8s-openapi = { version = "0.21.0", features = ["v1_27"] }
+kube = "0.88.1"
+percent-encoding = "2.3.1"
+poise = "0.6.1"
+reqwest = { version = "0.12.2", features = ["json", "rustls-tls", "h2", "http2"], default-features = false }
+serde = { version = "1.0.197", features = ["derive"] }
+serde_json = "1.0.115"
+tokio = { version = "1.36.0", features = ["rt-multi-thread", "signal"] }
+tracing = "0.1.40"
+tracing-subscriber = "0.3.18"
+url = "2.5.0"
+uuid = { version = "1.8.0", features = ["v4"] }
