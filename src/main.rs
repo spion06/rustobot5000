@@ -16,7 +16,6 @@ extern crate gstreamer as gst;
 #[allow(dead_code)]
 struct ShowSearch {
     show_name: String,
-    show_season: Option<String>,
 }
 
 // Define a custom error type
@@ -371,36 +370,36 @@ pub async fn shutdown(ctx: Context<'_>) -> Result<(), Error> {
 
 #[poise::command(prefix_command, track_edits, slash_command)]
 pub async fn rusto_player(ctx: Context<'_>) -> Result<(), Error> {
-    let uuid_boop = ctx.id();
+    let interaction_prefix = "rustobot";
     let buttons = vec![
         serenity::CreateActionRow::Buttons(vec![
-            serenity::CreateButton::new(format!("{uuid_boop}_play"))
+            serenity::CreateButton::new(format!("{interaction_prefix}_play"))
                 .style(serenity::ButtonStyle::Primary)
                 .label("play")
                 .emoji('\u{25B6}'),
-            serenity::CreateButton::new(format!("{uuid_boop}_pause"))
+            serenity::CreateButton::new(format!("{interaction_prefix}_pause"))
                 .style(serenity::ButtonStyle::Primary)
                 .label("pause")
                 .emoji('\u{23F8}'),
-            serenity::CreateButton::new(format!("{uuid_boop}_stop"))
+            serenity::CreateButton::new(format!("{interaction_prefix}_stop"))
                 .style(serenity::ButtonStyle::Primary)
                 .label("stop")
                 .emoji('\u{23F9}'),
-            serenity::CreateButton::new(format!("{uuid_boop}_skip"))
+            serenity::CreateButton::new(format!("{interaction_prefix}_skip"))
                 .style(serenity::ButtonStyle::Primary)
                 .label("skip")
                 .emoji('\u{23ED}'),
         ]),
         serenity::CreateActionRow::Buttons(vec![
-            serenity::CreateButton::new(format!("{uuid_boop}_search"))
+            serenity::CreateButton::new(format!("{interaction_prefix}_search"))
                 .style(serenity::ButtonStyle::Primary)
                 .label("search")
                 .emoji('\u{1F50D}'),
-            serenity::CreateButton::new(format!("{uuid_boop}_show_queue"))
+            serenity::CreateButton::new(format!("{interaction_prefix}_show_queue"))
                 .style(serenity::ButtonStyle::Primary)
                 .label("queue")
                 .emoji('\u{1F4DC}'),
-            serenity::CreateButton::new(format!("{uuid_boop}_now_playing"))
+            serenity::CreateButton::new(format!("{interaction_prefix}_now_playing"))
                 .style(serenity::ButtonStyle::Primary)
                 .label("now playing")
                 .emoji('\u{1F3A6}'),
@@ -419,7 +418,7 @@ pub async fn rusto_player(ctx: Context<'_>) -> Result<(), Error> {
         .author_id(ctx.author().id)
         .channel_id(ctx.channel_id())
         .timeout(std::time::Duration::from_secs(3600))
-        .filter(move |mci| mci.data.custom_id.starts_with(&uuid_boop.to_string()))
+        .filter(move |mci| mci.data.custom_id.starts_with(&interaction_prefix.to_string()))
         .await
     {
         let mut send_final = true;
@@ -496,7 +495,7 @@ pub async fn rusto_player(ctx: Context<'_>) -> Result<(), Error> {
             }
         }
         if mci.data.custom_id.ends_with("show_queue") {
-            let result_box = get_queue_selector(&pipeline_ref, uuid_boop.to_string().as_str()).await;
+            let result_box = get_queue_selector(&pipeline_ref, interaction_prefix.to_string().as_str()).await;
             msg.edit(
                 ctx,
                 serenity::EditMessage::new().components(buttons.clone().iter().chain(result_box.iter()).cloned().collect())
@@ -520,7 +519,7 @@ pub async fn rusto_player(ctx: Context<'_>) -> Result<(), Error> {
                     serenity::EditMessage::new().content(format!("Removing item {}", queue_item))
                 ).await?;
                 pipeline_ref.remove_uri(&Uuid::from_str(queue_item).unwrap())?;
-                let result_box = get_queue_selector(&pipeline_ref, uuid_boop.to_string().as_str()).await;
+                let result_box = get_queue_selector(&pipeline_ref, interaction_prefix.to_string().as_str()).await;
                 msg.edit(
                     ctx,
                     serenity::EditMessage::new().components(buttons.clone().iter().chain(result_box.iter()).cloned().collect())
@@ -546,7 +545,7 @@ pub async fn rusto_player(ctx: Context<'_>) -> Result<(), Error> {
             match get_seasons(ctx.data().emby_client.as_ref(), series_id).await {
                 Ok(seasons) => {
                     result_box.push(
-                        serenity::CreateActionRow::SelectMenu(serenity::CreateSelectMenu::new(format!("{}_season_result", uuid_boop), seasons.result_box).placeholder(format!("{} Seasons", seasons.result_items))),
+                        serenity::CreateActionRow::SelectMenu(serenity::CreateSelectMenu::new(format!("{}_season_result", interaction_prefix), seasons.result_box).placeholder(format!("{} Seasons", seasons.result_items))),
                     );
                     message = format!("Found {} Seasons", seasons.result_items);
                 }
@@ -578,7 +577,7 @@ pub async fn rusto_player(ctx: Context<'_>) -> Result<(), Error> {
             match get_episodes(ctx.data().emby_client.as_ref(), season_id).await {
                 Ok(seasons) => {
                     result_box.push(
-                        serenity::CreateActionRow::SelectMenu(serenity::CreateSelectMenu::new(format!("{}_episodes_result", uuid_boop), seasons.result_box).placeholder(format!("{} Series Episodes", seasons.result_items))),
+                        serenity::CreateActionRow::SelectMenu(serenity::CreateSelectMenu::new(format!("{}_episodes_result", interaction_prefix), seasons.result_box).placeholder(format!("{} Series Episodes", seasons.result_items))),
                     );
                     message = format!("Found {} Episodes", seasons.result_items);
                 }
@@ -633,9 +632,14 @@ pub async fn rusto_player(ctx: Context<'_>) -> Result<(), Error> {
             ).await?;
         }
         if mci.data.custom_id.ends_with("search") {
-            let data = poise::execute_modal_on_component_interaction::<ShowSearch>(ctx, mci.clone(), None, None).await;
+            // this will block until a user respons and prevent 
+            msg.edit(
+                ctx,
+                serenity::EditMessage::new().content("Waiting for user input...")
+            ).await?;
+            let data = poise::execute_modal_on_component_interaction::<ShowSearch>(ctx, mci.clone(), None, Some(std::time::Duration::from_secs(30))).await;
             let mut result_box: Vec<CreateActionRow> = vec![];
-            let mut message: String = "No results found".to_string();
+            let mut message: String = "No results or input timeout found".to_string();
             match &data {
                 Ok(d) => {
                     send_final = false;
@@ -646,11 +650,11 @@ pub async fn rusto_player(ctx: Context<'_>) -> Result<(), Error> {
                                     if list.result_items == 0 {
                                         let empty_result = CreateSelectMenuKind::String { options: vec![CreateSelectMenuOption::new("No Results found!", "empty")] };
                                         result_box.push(
-                                            serenity::CreateActionRow::SelectMenu(serenity::CreateSelectMenu::new(format!("{}_series_result", uuid_boop), empty_result).placeholder("Series Search Results")),
+                                            serenity::CreateActionRow::SelectMenu(serenity::CreateSelectMenu::new(format!("{}_series_result", interaction_prefix), empty_result).placeholder("Series Search Results")),
                                         )
                                     } else {
                                         result_box.push(
-                                            serenity::CreateActionRow::SelectMenu(serenity::CreateSelectMenu::new(format!("{}_series_result", uuid_boop), list.result_box).placeholder("Series Search Results")),
+                                            serenity::CreateActionRow::SelectMenu(serenity::CreateSelectMenu::new(format!("{}_series_result", interaction_prefix), list.result_box).placeholder("Series Search Results")),
                                         )
                                     }
                                     message = format!("Found {} results", list.result_items);
@@ -846,7 +850,7 @@ async fn main() {
     let shared_play_queue = Arc::new(Mutex::new(play_queue));
     let main_playqueue = Arc::clone(&shared_play_queue.clone());
     let eos_watch_playqueue = Arc::clone(&shared_play_queue.clone());
-    tokio::spawn(async move {
+    let eos_thread = tokio::spawn(async move {
         PlayQueue::add_eos_watch(&eos_watch_playqueue).await;
     });
     let emby_client = EmbyClient::new(emby_api_address, emby_api_token).await.unwrap();
@@ -910,6 +914,7 @@ async fn main() {
         _ = sig_quit.recv() => println!("Received SIGQUIT, shutting down..."),
     };
     client.shard_manager.shutdown_all().await;
+    eos_thread.abort();
     match shared_play_queue.clone().lock().await.stop_playback() {
         Ok(_) => (),
         Err(e) => error!("error stopping pipeline {}", e)

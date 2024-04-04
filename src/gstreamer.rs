@@ -342,6 +342,8 @@ pub(crate) fn get_rtmp_pipeline(rtmp_host: &str) -> Result<Pipeline, Error>  {
     let uridecode = gst::ElementFactory::make("uridecodebin")
         .name("src")
         .property("force-sw-decoders", true)
+        .property("use-buffering", true)
+        .property("buffer-size", 100 * 1024 * 1024)
         .build()?;
 
     pipeline.add(&uridecode)?;
