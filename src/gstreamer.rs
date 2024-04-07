@@ -274,12 +274,14 @@ pub(crate) fn start_pipeline(pipeline: &Pipeline) -> Result<String, Error> {
         return Err(anyhow!("stream is already playing"))
     }
     let src_element = get_value_or_error(pipeline.by_name("src"), "unable to get source element from pipeline")?;
-    let set_uri = get_string_property(&src_element, "uri")?;
+    let set_uri = get_string_property(&src_element, "uri")?.clone();
+    pipeline.set_state(gst::State::Ready)?;
     pipeline.set_state(gst::State::Playing)?;
     Ok(set_uri)
 }
 
 pub(crate) fn stop_pipeline(pipeline: &Pipeline) -> Result<(), Error> {
+    pipeline.set_state(gst::State::Ready)?;
     pipeline.set_state(gst::State::Null)?;
     Ok(())
 }
