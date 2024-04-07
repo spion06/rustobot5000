@@ -24,13 +24,13 @@ pub(crate) struct EmbyItemData {
 
 #[derive(Deserialize, Debug)]
 struct EmbySearchResult {
-    #[serde(rename = "SearchHints")]
+    #[serde(default, rename = "SearchHints")]
     search_hints: Vec<EmbyItemData>
 }
 
 #[derive(Deserialize, Debug)]
 struct EmbyItemsResult {
-    #[serde(rename = "Items")]
+    #[serde(default, rename = "Items")]
     items: Vec<EmbyItemData>
 }
 
@@ -39,6 +39,7 @@ pub(crate) trait EmbySearch {
     async fn get_seasons_for_series(&self, series_id: &str) -> Result<Vec<EmbyItemData>, Error>;
     async fn get_episodes_for_season(&self, season_id: &str) -> Result<Vec<EmbyItemData>, Error>;
     async fn get_episode_info(&self, episode_id: &str) -> Result<EmbyItemData, Error>;
+    async fn get_all_series(&self) -> Result<Vec<EmbyItemData>, Error>;
 }
 
 pub(crate) struct EmbyClient {
@@ -70,14 +71,14 @@ impl EmbyClient {
 
 impl EmbySearch for EmbyClient {
     async fn search_series(&self, series_name: &str) -> Result<Vec<EmbyItemData>, Error> {
-        let url = format!("Search/Hints?SearchTerm={}&IncludeItemTypes=Series", series_name);
+        let url = format!("Items?Recursive=true&IncludeItemTypes=Series&SortBy=SortName&SearchTerm={}", series_name);
         let resp = self.do_emby_get(&url).await?;
         let resp_status = resp.status();
         let resp_body = resp.bytes().await?;
         if resp_status.clone().is_success() {
-            match serde_json::from_slice::<EmbySearchResult>(&resp_body) {
+            match serde_json::from_slice::<EmbyItemsResult>(&resp_body) {
                 Ok(series) => {
-                    Ok(series.search_hints)
+                    Ok(series.items)
                 }
                 Err(e) => {
                     Err(anyhow!(format!("error deserializing data {}: {}", e, String::from_utf8_lossy(&resp_body))).into())
@@ -144,6 +145,24 @@ impl EmbySearch for EmbyClient {
                             Err(anyhow!(err_msg))
                         }
                     }
+                }
+                Err(e) => {
+                    Err(anyhow!(format!("error deserializing data {}: {}", e, String::from_utf8_lossy(&resp_body))).into())
+                }
+            }
+        } else {
+            Err(anyhow!(format!("error getting data {}: {}", resp_status.as_str(), String::from_utf8_lossy(&resp_body))).into())
+        }
+    }
+    async fn get_all_series(&self) -> Result<Vec<EmbyItemData>, Error> {
+        let url = "Items?Recursive=true&IncludeItemTypes=Series&SortBy=SortName";
+        let resp = self.do_emby_get(&url).await?;
+        let resp_status = resp.status();
+        let resp_body = resp.bytes().await?;
+        if resp_status.clone().is_success() {
+            match serde_json::from_slice::<EmbyItemsResult>(&resp_body) {
+                Ok(series) => {
+                    Ok(series.items)
                 }
                 Err(e) => {
                     Err(anyhow!(format!("error deserializing data {}: {}", e, String::from_utf8_lossy(&resp_body))).into())
