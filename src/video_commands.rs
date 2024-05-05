@@ -5,7 +5,7 @@ use std::str::FromStr;
 use tracing::{info, error, warn};
 
 
-#[poise::command(slash_command, default_member_permissions = "ADMINISTRATOR", subcommands("add", "play", "pause", "stop", "skip", "list_series", "player"), subcommand_required)]
+#[poise::command(slash_command, default_member_permissions = "ADMINISTRATOR", subcommands("add", "play", "pause", "stop", "skip", "list_series", "player", "seek"), subcommand_required)]
 pub(crate) async fn rusto_video(_: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
@@ -108,6 +108,26 @@ async fn skip(
 }
 
 #[poise::command(slash_command, default_member_permissions = "ADMINISTRATOR")]
+async fn seek(
+    ctx: Context<'_>,
+    seek_seconds: i64,
+) -> Result<(), Error> {
+    let mut pipeline_ref = ctx.data().get_pipeline_ref().await;
+    match &pipeline_ref.seek_video(seek_seconds) {
+        Ok(_) => {
+            ctx.say(format!("seeked {} seconds", seek_seconds)).await?;
+            Ok(())
+        },
+        Err(e) => {
+            let err_msg = format!("error seeking video: {}", e);
+            ctx.say(err_msg.clone()).await?;
+            error!(err_msg);
+            Err(bot_error(err_msg.as_str()))
+        }
+    }
+}
+
+#[poise::command(slash_command, default_member_permissions = "ADMINISTRATOR")]
 async fn list_series(
     ctx: Context<'_>,
 ) -> Result<(), Error> {
@@ -155,6 +175,28 @@ pub async fn player(ctx: Context<'_>) -> Result<(), Error> {
                 .style(serenity::ButtonStyle::Primary)
                 .label("now playing")
                 .emoji('\u{1F3A6}'),
+        ]),
+        serenity::CreateActionRow::Buttons(vec![
+            serenity::CreateButton::new(format!("{interaction_prefix}_seek_minus_300"))
+                .style(serenity::ButtonStyle::Primary)
+                .label("-5m")
+                .emoji('\u{23EA}'),
+            serenity::CreateButton::new(format!("{interaction_prefix}_seek_minus_60"))
+                .style(serenity::ButtonStyle::Primary)
+                .label("-1m")
+                .emoji('\u{23EA}'),
+            serenity::CreateButton::new(format!("{interaction_prefix}_seek_plus_60"))
+                .style(serenity::ButtonStyle::Primary)
+                .label("+1m")
+                .emoji('\u{23E9}'),
+            serenity::CreateButton::new(format!("{interaction_prefix}_seek_plus_300"))
+                .style(serenity::ButtonStyle::Primary)
+                .label("+5m")
+                .emoji('\u{23E9}'),
+            serenity::CreateButton::new(format!("{interaction_prefix}_seek_plus_900"))
+                .style(serenity::ButtonStyle::Primary)
+                .label("+15m")
+                .emoji('\u{23E9}'),
         ]),
     ];
 
@@ -248,6 +290,48 @@ pub async fn player(ctx: Context<'_>) -> Result<(), Error> {
                     ).await?;
                 }
             }
+        }
+        if mci.data.custom_id.contains("_seek_") {
+            let parts: Vec<&str> = mci.data.custom_id.split('_').collect();
+            let numeric_parts: i64 = match parts.last() {
+                Some(&num_str) => {
+                    match num_str.parse() {
+                        Ok(num) => num,
+                        Err(_) => 0,
+                    }
+                },
+                None => {
+                    msg.edit(
+                        ctx,
+                        serenity::EditMessage::new().content(format!("error getting seek amount"))
+                    ).await?;
+                    0 as i64
+                }
+            };
+
+            let numeric_sign: i64 = match parts.get(parts.len() - 2) {
+                Some(&sign) => {
+                    if sign == "minus" {
+                        -1
+                    } else {
+                        1
+                    }
+                }
+                None => {
+                    msg.edit(
+                        ctx,
+                        serenity::EditMessage::new().content(format!("error getting seek sign"))
+                    ).await?;
+                    0
+                }
+            };
+
+            let seek_amount = numeric_sign * numeric_parts;
+
+            if numeric_parts != 0 {
+                pipeline_ref.seek_video(seek_amount)?;
+            }
+
         }
         if mci.data.custom_id.ends_with("show_queue") {
             let result_box = get_queue_selector(&pipeline_ref, interaction_prefix.to_string().as_str()).await;

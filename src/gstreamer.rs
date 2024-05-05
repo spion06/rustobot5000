@@ -215,6 +215,17 @@ impl PlayQueue {
         Ok(())
     }
 
+    pub fn seek_video(&mut self, seek_seconds: i64) -> Result<(), Error> {
+        match seek_pipeline(&self.pipeline, seek_seconds) {
+            Ok(_) => {
+            }
+            Err(e) => {
+                return Err(e)
+            }
+        }
+        Ok(())
+    }
+
     // More functions for controlling playback and handling EOS, etc.
 }
 
@@ -275,9 +286,32 @@ pub(crate) fn start_pipeline(pipeline: &Pipeline) -> Result<String, Error> {
     }
     let src_element = get_value_or_error(pipeline.by_name("src"), "unable to get source element from pipeline")?;
     let set_uri = get_string_property(&src_element, "uri")?.clone();
-    pipeline.set_state(gst::State::Ready)?;
+    if pipeline.current_state() != gst::State::Paused {
+        pipeline.set_state(gst::State::Ready)?;
+    }
     pipeline.set_state(gst::State::Playing)?;
     Ok(set_uri)
+}
+
+pub(crate) fn seek_pipeline(pipeline: &Pipeline, seek_seconds: i64) -> Result<(), Error> {
+    if pipeline.current_state() != gst::State::Playing {
+        return Err(anyhow!("cannot seek on non-playing stream"))
+    }
+    let src_element = get_value_or_error(pipeline.by_name("src"), "unable to get source element from pipeline")?;
+
+    let current_pos_ct = get_value_or_error(src_element.query_position::<gst::ClockTime>(), "unable to get current position")?;
+    info!("current position {}s", current_pos_ct.seconds());
+    let new_pos = if seek_seconds.is_negative() {
+        current_pos_ct.seconds() - seek_seconds.wrapping_abs() as u64
+    } else {
+        current_pos_ct.seconds() + seek_seconds.wrapping_abs() as u64
+    };
+    let seek_flags = gst::SeekFlags::FLUSH;
+    info!("setting position to {}", new_pos);
+
+    src_element.seek_simple(seek_flags, gst::ClockTime::from_seconds(new_pos))?;
+
+    return Ok(())
 }
 
 pub(crate) fn stop_pipeline(pipeline: &Pipeline) -> Result<(), Error> {
