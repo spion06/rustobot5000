@@ -215,15 +215,15 @@ impl PlayQueue {
         Ok(())
     }
 
-    pub fn seek_video(&mut self, seek_seconds: i64) -> Result<(), Error> {
+    pub fn seek_video(&mut self, seek_seconds: i64) -> Result<u64, Error> {
         match seek_pipeline(&self.pipeline, seek_seconds) {
-            Ok(_) => {
+            Ok(pos) => {
+                Ok(pos)
             }
             Err(e) => {
-                return Err(e)
+                Err(e)
             }
         }
-        Ok(())
     }
 
     // More functions for controlling playback and handling EOS, etc.
@@ -293,25 +293,35 @@ pub(crate) fn start_pipeline(pipeline: &Pipeline) -> Result<String, Error> {
     Ok(set_uri)
 }
 
-pub(crate) fn seek_pipeline(pipeline: &Pipeline, seek_seconds: i64) -> Result<(), Error> {
+pub(crate) fn seek_pipeline(pipeline: &Pipeline, seek_seconds: i64) -> Result<u64, Error> {
     if pipeline.current_state() != gst::State::Playing {
         return Err(anyhow!("cannot seek on non-playing stream"))
     }
     let src_element = get_value_or_error(pipeline.by_name("src"), "unable to get source element from pipeline")?;
 
     let current_pos_ct = get_value_or_error(src_element.query_position::<gst::ClockTime>(), "unable to get current position")?;
+    let max_pos_ct = get_value_or_error(src_element.query_duration::<gst::ClockTime>(), "unable to get max position")?;
     info!("current position {}s", current_pos_ct.seconds());
     let new_pos = if seek_seconds.is_negative() {
-        current_pos_ct.seconds() - seek_seconds.wrapping_abs() as u64
+        if current_pos_ct.seconds() > seek_seconds.wrapping_abs() as u64 {
+            current_pos_ct.seconds() - seek_seconds.wrapping_abs() as u64
+        } else {
+            0
+        }
     } else {
-        current_pos_ct.seconds() + seek_seconds.wrapping_abs() as u64
+        let next_pos = current_pos_ct.seconds() + seek_seconds.wrapping_abs() as u64;
+        if next_pos >= max_pos_ct.seconds() && max_pos_ct.seconds() > 0 {
+            max_pos_ct.seconds()
+        } else {
+            next_pos
+        }
     };
     let seek_flags = gst::SeekFlags::FLUSH;
     info!("setting position to {}", new_pos);
 
     src_element.seek_simple(seek_flags, gst::ClockTime::from_seconds(new_pos))?;
 
-    return Ok(())
+    return Ok(new_pos)
 }
 
 pub(crate) fn stop_pipeline(pipeline: &Pipeline) -> Result<(), Error> {

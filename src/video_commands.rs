@@ -114,8 +114,8 @@ async fn seek(
 ) -> Result<(), Error> {
     let mut pipeline_ref = ctx.data().get_pipeline_ref().await;
     match &pipeline_ref.seek_video(seek_seconds) {
-        Ok(_) => {
-            ctx.say(format!("seeked {} seconds", seek_seconds)).await?;
+        Ok(pos) => {
+            ctx.say(format!("seeked {}s to {}s", seek_seconds, pos)).await?;
             Ok(())
         },
         Err(e) => {
@@ -329,7 +329,18 @@ pub async fn player(ctx: Context<'_>) -> Result<(), Error> {
             let seek_amount = numeric_sign * numeric_parts;
 
             if numeric_parts != 0 {
-                pipeline_ref.seek_video(seek_amount)?;
+                let response = match pipeline_ref.seek_video(seek_amount) {
+                    Ok(dst_ts) => {
+                        format!("seeked to {}s", dst_ts)
+                    }
+                    Err(e) => {
+                        format!("Error seeking {}", e)
+                    }
+                };
+                msg.edit(
+                    ctx,
+                    serenity::EditMessage::new().content(response)
+                ).await?;
             }
 
         }
