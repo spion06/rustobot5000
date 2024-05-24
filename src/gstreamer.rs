@@ -2,14 +2,16 @@ extern crate gstreamer as gst;
 extern crate gstreamer_audio as gst_audio;
 extern crate gstreamer_pbutils as gst_pbutils;
 extern crate gstreamer_video as gst_video;
+
 use gst::{glib, MessageView, Pipeline};
 use anyhow::{Error, anyhow};
 use derive_more::{Display, Error};
 use poise::serenity_prelude::futures::StreamExt;
 
+use tokio::{sync::Mutex as TokioMutex};
 use url::Url;
 
-use std::{collections::VecDeque, fmt::Debug, path::Path, sync::{Arc, Mutex}};
+use std::{collections::VecDeque, fmt::Debug, future::{Future}, path::Path, pin::Pin, sync::{Arc, Mutex}};
 use gst_pbutils::{prelude::*, ElementPropertiesMapItem};
 
 
@@ -39,15 +41,17 @@ fn get_value_or_error<T>(option: Option<T>, error: &str) -> Result<T, Error> {
 pub(crate) struct QueueItem {
     display_name: String,
     uri: Url,
+    stop_fn: Option<Arc<TokioMutex<Pin<Box<dyn Future<Output = bool> + Send>>>>>,
     id: Uuid,
 }
 
 impl QueueItem {
-    pub fn new(display_name: String, uri: Url) -> Self {
+    pub fn new(display_name: String, uri: Url, stop_fn: Option<Arc<TokioMutex<Pin<Box<dyn Future<Output = bool> + Send>>>>>) -> Self {
         QueueItem {
             display_name: display_name,
             uri: uri,
             id: Uuid::new_v4(),
+            stop_fn: stop_fn,
         }
     }
 
@@ -61,6 +65,18 @@ impl QueueItem {
 
     pub fn id(&self) -> Uuid {
         self.id.clone()
+    }
+
+
+    pub async fn run_stop_fn(&self) -> bool {
+        match &self.stop_fn {
+            Some(func) => {
+                let func = func.clone();
+                let res = func.lock().await.as_mut().await;
+                res
+            },
+            None => false,
+        }
     }
     
 }
@@ -99,7 +115,7 @@ impl PlayQueue {
         while let Some(msg) = messages.next().await {
             match msg.view() {
                 MessageView::Eos(..) => {
-                    match playqueue_clone.lock().await.skip_video() {
+                    match playqueue_clone.lock().await.skip_video().await {
                         Ok(_) => (),
                         Err(e) => error!("{}", e)
                     };
@@ -111,7 +127,7 @@ impl PlayQueue {
     }
 
     // Function to add a URI to the queue
-    pub fn add_uri(&mut self, uri: String, display_name: String) -> Result<QueueItem, Error> {
+    pub fn add_uri(&mut self, uri: String, display_name: String, stop_fn: Option<Arc<TokioMutex<Pin<Box<dyn Future<Output = bool> + Send>>>>>) -> Result<QueueItem, Error> {
         let queue_uri: String;
         if uri.starts_with("/") {
             let path = Path::new(&uri);
@@ -119,7 +135,7 @@ impl PlayQueue {
         } else {
             queue_uri = uri;
         }
-        let queue_item = QueueItem::new(display_name, Url::parse(&queue_uri).unwrap());
+        let queue_item = QueueItem::new(display_name, Url::parse(&queue_uri).unwrap(), stop_fn);
         self.uris.push_back(queue_item.clone());
         Ok(queue_item)
     }
@@ -157,7 +173,7 @@ impl PlayQueue {
     }
 
     // Function to start playback
-    pub fn start_playback(&mut self) -> Result<Option<QueueItem>, Error> {
+    pub async fn start_playback(&mut self) -> Result<Option<QueueItem>, Error> {
         match self.pipeline.current_state() {
             gst::State::Null => {
                 match self.queue_next_item() {
@@ -177,10 +193,14 @@ impl PlayQueue {
         Ok(self.current_item.clone())
     }
 
-    pub fn stop_playback(&mut self) -> Result<(), Error> {
+    pub async fn stop_playback(&mut self) -> Result<(), Error> {
         match self.pipeline.current_state() {
             gst::State::Playing|gst::State::Paused|gst::State::Ready => {
                 stop_pipeline(&self.pipeline)?;
+                match &self.current_item {
+                    Some(i) => {i.run_stop_fn().await; ()},
+                    None => (),
+                }
                 self.current_item = None;
             }
             _ => {
@@ -190,7 +210,7 @@ impl PlayQueue {
         Ok(())
     }
 
-    pub fn pause_playback(&mut self) -> Result<(), Error> {
+    pub async fn pause_playback(&mut self) -> Result<(), Error> {
         match self.pipeline.current_state() {
             gst::State::Playing => {
                 pause_pipeline(&self.pipeline)?;
@@ -203,19 +223,19 @@ impl PlayQueue {
         Ok(())
     }
 
-    pub fn skip_video(&mut self) -> Result<(), Error> {
-        match self.stop_playback() {
+    pub async fn skip_video(&mut self) -> Result<(), Error> {
+        match self.stop_playback().await {
             Ok(_) => {
             }
             Err(e) => {
                 return Err(e)
             }
         }
-        self.start_playback()?;
+        self.start_playback().await?;
         Ok(())
     }
 
-    pub fn seek_video(&mut self, seek_seconds: i64) -> Result<u64, Error> {
+    pub async fn seek_video(&mut self, seek_seconds: i64) -> Result<u64, Error> {
         match seek_pipeline(&self.pipeline, seek_seconds) {
             Ok(pos) => {
                 Ok(pos)
@@ -401,21 +421,21 @@ pub(crate) fn get_rtmp_pipeline(rtmp_host: &str) -> Result<Pipeline, Error>  {
         let pad_type = pad_struct.name();
         if pad_type.starts_with("video/x-raw") {
             if video_sink_real.is_linked() {
-                println!("video sink is already linked!");
+                info!("video sink is already linked!");
                 return;
             }
             src_pad.link(&video_sink_real).unwrap();
         }
         if pad_type.starts_with("audio/x-raw") {
             if audio_sink_real.is_linked() {
-                println!("audio sink is already linked!");
+                info!("audio sink is already linked!");
                 return;
             }
             src_pad.link(&audio_sink_real).unwrap();
         }
         if pad_type.starts_with("text/x-raw") {
             if subtitle_sink_real.is_linked() {
-                println!("subtitle sink is already linked!");
+                info!("subtitle sink is already linked!");
                 return;
             }
             src_pad.link(&subtitle_sink_real).unwrap();

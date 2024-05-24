@@ -7,6 +7,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.81"
+async-trait = "0.1.80"
 bitflags = "2.4.2"
 crc32fast = "1.4.0"
 derive_more = "0.99.17"

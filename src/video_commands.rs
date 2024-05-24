@@ -17,7 +17,7 @@ async fn add(
     #[description = "path to a video to play"] url: String,
 ) -> Result<(), Error> {
     let mut pipeline_ref = ctx.data().get_pipeline_ref().await;
-    match &pipeline_ref.add_uri(url.clone(), url.clone().split("/").last().unwrap().to_string()) {
+    match &pipeline_ref.add_uri(url.clone(), url.clone().split("/").last().unwrap().to_string(), None) {
         Ok(_) => {
             ctx.say("queued video").await?;
             Ok(())
@@ -36,7 +36,7 @@ async fn play(
     ctx: Context<'_>,
 ) -> Result<(), Error> {
     let mut pipeline_ref = ctx.data().get_pipeline_ref().await;
-    match &pipeline_ref.start_playback() {
+    match &pipeline_ref.start_playback().await {
         Ok(_) => {
             ctx.say("played video").await?;
             Ok(())
@@ -55,7 +55,7 @@ async fn stop(
     ctx: Context<'_>,
 ) -> Result<(), Error> {
     let mut pipeline_ref = ctx.data().get_pipeline_ref().await;
-    match &pipeline_ref.stop_playback() {
+    match &pipeline_ref.stop_playback().await {
         Ok(_) => {
             ctx.say("stopped video").await?;
             Ok(())
@@ -74,7 +74,7 @@ async fn pause(
     ctx: Context<'_>,
 ) -> Result<(), Error> {
     let mut pipeline_ref = ctx.data().get_pipeline_ref().await;
-    match &pipeline_ref.pause_playback() {
+    match &pipeline_ref.pause_playback().await {
         Ok(_) => {
             ctx.say("paused current video").await?;
             Ok(())
@@ -93,7 +93,7 @@ async fn skip(
     ctx: Context<'_>,
 ) -> Result<(), Error> {
     let mut pipeline_ref = ctx.data().get_pipeline_ref().await;
-    match &pipeline_ref.skip_video() {
+    match &pipeline_ref.skip_video().await {
         Ok(_) => {
             ctx.say("skipped video").await?;
             Ok(())
@@ -113,7 +113,7 @@ async fn seek(
     seek_seconds: i64,
 ) -> Result<(), Error> {
     let mut pipeline_ref = ctx.data().get_pipeline_ref().await;
-    match &pipeline_ref.seek_video(seek_seconds) {
+    match &pipeline_ref.seek_video(seek_seconds).await {
         Ok(pos) => {
             ctx.say(format!("seeked {}s to {}s", seek_seconds, pos)).await?;
             Ok(())
@@ -127,23 +127,16 @@ async fn seek(
     }
 }
 
-#[poise::command(slash_command, default_member_permissions = "ADMINISTRATOR")]
-async fn list_series(
-    ctx: Context<'_>,
-) -> Result<(), Error> {
-    let emby_client = ctx.data().emby_client.as_ref();
-    let series_list = emby_client.get_all_series().await?.iter().map(|f| f.name.clone()).collect::<Vec<String>>().join("\n");
-    let attachment_name = "all_series.csv";
-    let attachment_logs = CreateAttachment::bytes(series_list.as_bytes(), attachment_name);
-    ctx.send(CreateReply::default().attachment(attachment_logs)).await?;
-    Ok(())
-}
-
-#[poise::command(prefix_command, track_edits, slash_command)]
-pub async fn player(ctx: Context<'_>) -> Result<(), Error> {
-    // using ctx.id here prevents issues with multiple bot instances
-    let interaction_prefix = ctx.id();
-    let buttons = vec![
+async fn get_buttons(interaction_prefix: String, user: &Option<EmbyItemData>, result_box: Option<Vec<CreateActionRow>>) -> Vec<CreateActionRow> {
+    let user_button_label = match user {
+        Some(u) => format!("User: {}", u.name),
+        None => "User: (None)".to_string(),
+    };
+    let result_box = match result_box {
+        Some(rb) => rb,
+        None => vec![],
+    };
+    vec![
         serenity::CreateActionRow::Buttons(vec![
             serenity::CreateButton::new(format!("{interaction_prefix}_play"))
                 .style(serenity::ButtonStyle::Primary)
@@ -175,6 +168,10 @@ pub async fn player(ctx: Context<'_>) -> Result<(), Error> {
                 .style(serenity::ButtonStyle::Primary)
                 .label("now playing")
                 .emoji('\u{1F3A6}'),
+            serenity::CreateButton::new(format!("{interaction_prefix}_select_user"))
+                .style(serenity::ButtonStyle::Primary)
+                .label(user_button_label)
+                .emoji('\u{1F9D4}'),
         ]),
         serenity::CreateActionRow::Buttons(vec![
             serenity::CreateButton::new(format!("{interaction_prefix}_seek_minus_300"))
@@ -198,12 +195,31 @@ pub async fn player(ctx: Context<'_>) -> Result<(), Error> {
                 .label("+15m")
                 .emoji('\u{23E9}'),
         ]),
-    ];
+    ].iter().chain(result_box.iter()).cloned().collect()
+}
+
+#[poise::command(slash_command, default_member_permissions = "ADMINISTRATOR")]
+async fn list_series(
+    ctx: Context<'_>,
+) -> Result<(), Error> {
+    let emby_client = ctx.data().emby_client.as_ref();
+    let series_list = emby_client.get_all_series().await?.iter().map(|f| f.name.clone()).collect::<Vec<String>>().join("\n");
+    let attachment_name = "all_series.csv";
+    let attachment_logs = CreateAttachment::bytes(series_list.as_bytes(), attachment_name);
+    ctx.send(CreateReply::default().attachment(attachment_logs)).await?;
+    Ok(())
+}
+
+#[poise::command(prefix_command, track_edits, slash_command)]
+pub async fn player(ctx: Context<'_>) -> Result<(), Error> {
+    // using ctx.id here prevents issues with multiple bot instances
+    let interaction_prefix = ctx.id();
+    let mut current_user = None;
 
     let reply = {
         CreateReply::default()
             .content("I want to watch something \u{1F346}")
-            .components(buttons.clone())
+            .components(get_buttons(interaction_prefix.to_string(), &current_user, None).await)
     };
 
     ctx.send(reply).await?;
@@ -222,7 +238,7 @@ pub async fn player(ctx: Context<'_>) -> Result<(), Error> {
         let mut msg = mci.message.clone();
         let mut pipeline_ref = ctx.data().get_pipeline_ref().await;
         if mci.data.custom_id.ends_with("play") {
-            match &pipeline_ref.start_playback() {
+            match &pipeline_ref.start_playback().await {
                 Ok(_v) => {
                     msg.edit(
                         ctx,
@@ -244,7 +260,7 @@ pub async fn player(ctx: Context<'_>) -> Result<(), Error> {
             ).await?;
         }
         if mci.data.custom_id.ends_with("pause") {
-            match &pipeline_ref.pause_playback() {
+            match &pipeline_ref.pause_playback().await {
                 Ok(_) => {
                     msg.edit(
                         ctx,
@@ -260,7 +276,7 @@ pub async fn player(ctx: Context<'_>) -> Result<(), Error> {
             }
         }
         if mci.data.custom_id.ends_with("stop") {
-            match &pipeline_ref.stop_playback() {
+            match &pipeline_ref.stop_playback().await {
                 Ok(_) => {
                     msg.edit(
                         ctx,
@@ -276,7 +292,7 @@ pub async fn player(ctx: Context<'_>) -> Result<(), Error> {
             }
         }
         if mci.data.custom_id.ends_with("skip") {
-            match &pipeline_ref.skip_video() {
+            match &pipeline_ref.skip_video().await {
                 Ok(_) => {
                     msg.edit(
                         ctx,
@@ -329,7 +345,7 @@ pub async fn player(ctx: Context<'_>) -> Result<(), Error> {
             let seek_amount = numeric_sign * numeric_parts;
 
             if numeric_parts != 0 {
-                let response = match pipeline_ref.seek_video(seek_amount) {
+                let response = match pipeline_ref.seek_video(seek_amount).await {
                     Ok(dst_ts) => {
                         format!("seeked to {}s", dst_ts)
                     }
@@ -348,7 +364,7 @@ pub async fn player(ctx: Context<'_>) -> Result<(), Error> {
             let result_box = get_queue_selector(&pipeline_ref, interaction_prefix.to_string().as_str()).await;
             msg.edit(
                 ctx,
-                serenity::EditMessage::new().components(buttons.clone().iter().chain(result_box.iter()).cloned().collect())
+                serenity::EditMessage::new().components(get_buttons(interaction_prefix.to_string(), &current_user, Some(result_box)).await)
             ).await?;
         }
 
@@ -372,7 +388,7 @@ pub async fn player(ctx: Context<'_>) -> Result<(), Error> {
                 let result_box = get_queue_selector(&pipeline_ref, interaction_prefix.to_string().as_str()).await;
                 msg.edit(
                     ctx,
-                    serenity::EditMessage::new().components(buttons.clone().iter().chain(result_box.iter()).cloned().collect())
+                    serenity::EditMessage::new().components(get_buttons(interaction_prefix.to_string(), &current_user, Some(result_box)).await)
                 ).await?;
             }
         }
@@ -405,7 +421,7 @@ pub async fn player(ctx: Context<'_>) -> Result<(), Error> {
             }
             msg.edit(
                 ctx,
-                serenity::EditMessage::new().content(message).components(buttons.clone().iter().chain(result_box.iter()).cloned().collect())
+                serenity::EditMessage::new().content(message).components(get_buttons(interaction_prefix.to_string(), &current_user, Some(result_box)).await)
             ).await?;
         }
 
@@ -424,7 +440,7 @@ pub async fn player(ctx: Context<'_>) -> Result<(), Error> {
             ).await?;
             let mut result_box: Vec<CreateActionRow> = vec![];
             let mut message: String = "No results found".to_string();
-            match get_episodes(ctx.data().emby_client.as_ref(), season_id).await {
+            match get_episodes(ctx.data().emby_client.as_ref(), season_id, &current_user).await {
                 Ok(seasons) => {
                     result_box.push(
                         serenity::CreateActionRow::SelectMenu(serenity::CreateSelectMenu::new(format!("{}_episodes_result", interaction_prefix), seasons.result_box).placeholder(format!("{} Series Episodes", seasons.result_items))),
@@ -437,7 +453,7 @@ pub async fn player(ctx: Context<'_>) -> Result<(), Error> {
             }
             msg.edit(
                 ctx,
-                serenity::EditMessage::new().content(message).components(buttons.clone().iter().chain(result_box.iter()).cloned().collect())
+                serenity::EditMessage::new().content(message).components(get_buttons(interaction_prefix.to_string(), &current_user, Some(result_box)).await)
             ).await?;
         }
 
@@ -465,7 +481,11 @@ pub async fn player(ctx: Context<'_>) -> Result<(), Error> {
                     serenity::EditMessage::new().content(format!("Got episode {}", episode_path))
                 ).await?;
                 let episode_path = episode_path.replace("/mnt/storage", "/mnt/zfspool/storage");
-                match &pipeline_ref.add_uri(episode_path.to_string(), generate_episode_name(episode_info.clone())) {
+                let stop_fn = match &current_user {
+                    Some(u) => Some(ctx.data().emby_client.as_ref().user_stop_fn(u.id.clone(), episode_info.id.clone()).await),
+                    None => None,
+                };
+                match &pipeline_ref.add_uri(episode_path.to_string(), generate_episode_name(episode_info.clone()), stop_fn) {
                     Ok(i) => {
                         message = format!("added {} to queue", i.name());
                     }
@@ -481,6 +501,55 @@ pub async fn player(ctx: Context<'_>) -> Result<(), Error> {
                 serenity::EditMessage::new().content(message)
             ).await?;
         }
+
+        // handle result from clicking on select user
+        if mci.data.custom_id.ends_with("select_user") {
+            msg.edit(
+                ctx,
+                serenity::EditMessage::new().content("Select a user")
+            ).await?;
+            let mut result_box: Vec<CreateActionRow> = vec![];
+            let mut message: String = "No results found".to_string();
+            match get_users(ctx.data().emby_client.as_ref()).await {
+                Ok(seasons) => {
+                    result_box.push(
+                        serenity::CreateActionRow::SelectMenu(serenity::CreateSelectMenu::new(format!("{}_user_list_result", interaction_prefix), seasons.result_box).placeholder(format!("{} Users", seasons.result_items))),
+                    );
+                    message = format!("Found {} Users", seasons.result_items);
+                }
+                Err(e) => {
+                    message = format!("Error getting users: {}", e);
+                }
+            }
+            msg.edit(
+                ctx,
+                serenity::EditMessage::new().content(message).components(get_buttons(interaction_prefix.to_string(), &current_user, Some(result_box)).await)
+            ).await?;
+        }
+
+        // handle result from clicking on select user
+        if mci.data.custom_id.ends_with("user_list_result") {
+            let user_id = match &mci.data.kind {
+                ComponentInteractionDataKind::StringSelect { values } => &values[0],
+                _ => {
+                    warn!("got an unknown selection kind on users");
+                    "unknown"
+                }
+            };
+            let mut message: String = "No results found".to_string();
+            let user_name = "";
+            if user_id == "None" {
+                current_user = None;
+            } else {
+                current_user = Some(ctx.data().emby_client.as_ref().get_user_by_id(user_id.to_string()).await?);
+            };
+            message = format!("Set user to {}", user_name);
+            msg.edit(
+                ctx,
+                serenity::EditMessage::new().content(message).components(get_buttons(interaction_prefix.to_string(), &current_user, None).await)
+            ).await?;
+        }
+
         if mci.data.custom_id.ends_with("search") {
             // this will block until a user respons and prevent 
             msg.edit(
@@ -519,7 +588,7 @@ pub async fn player(ctx: Context<'_>) -> Result<(), Error> {
                     }
                     msg.edit(
                         ctx,
-                        serenity::EditMessage::new().content(message).components(buttons.clone().iter().chain(result_box.iter()).cloned().collect())
+                        serenity::EditMessage::new().content(message).components(get_buttons(interaction_prefix.to_string(), &current_user, Some(result_box)).await)
                     ).await?;
                 },
                 Err(e) => {
@@ -563,6 +632,21 @@ async fn get_series(emby_client: &EmbyClient, series_name: &str) -> Result<EmbyS
     Ok( EmbySearchResult { result_box: row, result_items: menu_item_count} )
 }
 
+async fn get_users(emby_client: &EmbyClient) -> Result<EmbySearchResult, Error> {
+    let users = emby_client.get_users().await?;
+    let menu_options: Vec<CreateSelectMenuOption> = users
+      .iter()
+      .map(|user| {
+        CreateSelectMenuOption::new(user.name.to_string(), user.id.to_string())
+      })
+      .collect();
+    let menu_options: Vec<CreateSelectMenuOption> = vec![CreateSelectMenuOption::new("None", "None")].iter().chain(menu_options.iter()).cloned().collect();
+    let menu_item_count = menu_options.len();
+    info!("found {} users", menu_item_count.clone());
+    let row = serenity::CreateSelectMenuKind::String { options: menu_options };
+    Ok( EmbySearchResult { result_box: row, result_items: menu_item_count} )
+}
+
 async fn get_now_playing(pipeline_ref: &PlayQueue) -> String {
     match pipeline_ref.get_current_item() {
         Some(i) => {
@@ -589,11 +673,21 @@ async fn get_seasons(emby_client: &EmbyClient, series_id: &str) -> Result<EmbySe
 }
 
 fn generate_episode_name(episode: EmbyItemData) -> String {
-    format!("S{}E{} - {}", episode.season_num.as_ref().unwrap(), episode.episode_num.as_ref().unwrap(), episode.name)
+    let watched_icon = match episode.user_data {
+        Some(u) => {
+            if u.played {
+                format!("{}: ", '\u{1F7E2}')
+            } else {
+                format!("{}: ", '\u{1F534}')
+            }
+        }
+        None => "".to_string(),
+    };
+    format!("{}S{}E{} - {}", watched_icon, episode.season_num.as_ref().unwrap(), episode.episode_num.as_ref().unwrap(), episode.name)
 }
 
-async fn get_episodes(emby_client: &EmbyClient, season_id: &str) -> Result<EmbySearchResult, Error> {
-    let episode_result = match emby_client.get_episodes_for_season(season_id).await {
+async fn get_episodes(emby_client: &EmbyClient, season_id: &str, current_user: &Option<EmbyItemData>) -> Result<EmbySearchResult, Error> {
+    let episode_result = match emby_client.get_episodes_for_season(season_id, current_user).await {
         Ok(d) => Ok(d),
         Err(e) => Err(Box::new(BotError::new(e.to_string().as_str())))
     }?;

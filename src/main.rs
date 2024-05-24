@@ -257,7 +257,7 @@ async fn main() {
     };
     client.shard_manager.shutdown_all().await;
     eos_thread.abort();
-    match shared_play_queue.clone().lock().await.stop_playback() {
+    match shared_play_queue.clone().lock().await.stop_playback().await {
         Ok(_) => (),
         Err(e) => error!("error stopping pipeline {}", e)
     }

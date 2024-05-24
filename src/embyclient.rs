@@ -1,3 +1,4 @@
+
 use reqwest::{self, Response};
 use serde::{Deserialize, Deserializer};
 use serde::de::{self, Visitor};
@@ -6,6 +7,11 @@ use url::Url;
 use anyhow::{Error, anyhow};
 use tracing::{info, error};
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc};
+use tokio::sync::Mutex as TokioMutex;
+
 
 
 #[derive(Deserialize, Debug, Clone)]
@@ -20,6 +26,14 @@ pub(crate) struct EmbyItemData {
     pub(crate) episode_num: Option<String>,
     #[serde(default, rename = "ParentIndexNumber", deserialize_with = "deserialize_option_string_or_int")]
     pub(crate) season_num: Option<String>,
+    #[serde(default, rename = "UserData")]
+    pub(crate) user_data: Option<EmbyItemUserData>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub(crate) struct EmbyItemUserData {
+    #[serde(rename = "Played")]
+    pub(crate) played: bool
 }
 
 #[derive(Deserialize, Debug)]
@@ -37,11 +51,15 @@ struct EmbyItemsResult {
 pub(crate) trait EmbySearch {
     async fn search_series(&self, series_name: &str) -> Result<Vec<EmbyItemData>, Error>;
     async fn get_seasons_for_series(&self, series_id: &str) -> Result<Vec<EmbyItemData>, Error>;
-    async fn get_episodes_for_season(&self, season_id: &str) -> Result<Vec<EmbyItemData>, Error>;
+    async fn get_episodes_for_season(&self, season_id: &str, user: &Option<EmbyItemData>) -> Result<Vec<EmbyItemData>, Error>;
     async fn get_episode_info(&self, episode_id: &str) -> Result<EmbyItemData, Error>;
     async fn get_all_series(&self) -> Result<Vec<EmbyItemData>, Error>;
+    async fn get_users(&self) -> Result<Vec<EmbyItemData>, Error>;
+    async fn get_user_by_id(&self, user_id: String) -> Result<EmbyItemData, Error>;
+    async fn user_stop_fn(&self, user_id: String, media_id: String) -> Arc<TokioMutex<Pin<Box<dyn Future<Output = bool> + Send>>>>;
 }
 
+#[derive(Clone)]
 pub(crate) struct EmbyClient {
     emby_url: Url,
     api_key: String,
@@ -59,6 +77,19 @@ impl EmbyClient {
         let req_url = self.emby_url.join("/emby/")?.join(url)?;
         info!("doing request against {}", req_url.clone());
         match reqwest::Client::new().get(req_url.clone()).header("X-Emby-Token", self.api_key.as_str()).send().await {
+            Ok(r) => {
+                Ok(r)
+            }
+            Err(e) => {
+                Err(anyhow!(format!("Error calling {}: {}", req_url.clone(), e)))
+            }
+        }
+    }
+
+    async fn do_emby_post(&self, url: &str) -> Result<Response, Error> {
+        let req_url = self.emby_url.join("/emby/")?.join(url)?;
+        info!("doing post request against {}", req_url.clone());
+        match reqwest::Client::new().post(req_url.clone()).header("X-Emby-Token", self.api_key.as_str()).send().await {
             Ok(r) => {
                 Ok(r)
             }
@@ -108,8 +139,12 @@ impl EmbySearch for EmbyClient {
         }
     }
     
-    async fn get_episodes_for_season(&self, season_id: &str) -> Result<Vec<EmbyItemData>, Error> {
-        let url = format!("Items?ParentId={}&Fields=Path&IsMissing=false&SortBy=PremiereDate", season_id);
+    async fn get_episodes_for_season(&self, season_id: &str, user: &Option<EmbyItemData>) -> Result<Vec<EmbyItemData>, Error> {
+        let url_prefix = match user {
+            Some(u) => format!("Users/{}/", u.id),
+            None => "".to_string(),
+        };
+        let url = format!("{}Items?ParentId={}&Fields=Path&IsMissing=false&SortBy=PremiereDate", url_prefix, season_id);
         let resp = self.do_emby_get(&url).await?;
         let resp_status = resp.status();
         let resp_body = resp.bytes().await?;
@@ -171,6 +206,53 @@ impl EmbySearch for EmbyClient {
         } else {
             Err(anyhow!(format!("error getting data {}: {}", resp_status.as_str(), String::from_utf8_lossy(&resp_body))).into())
         }
+    }
+
+    async fn get_users(&self) -> Result<Vec<EmbyItemData>, Error> {
+        let url = "Users/Query";
+        let resp = self.do_emby_get(&url).await?;
+        let resp_status = resp.status();
+        let resp_body = resp.bytes().await?;
+        if resp_status.clone().is_success() {
+            match serde_json::from_slice::<EmbyItemsResult>(&resp_body) {
+                Ok(series) => {
+                    Ok(series.items)
+                }
+                Err(e) => {
+                    Err(anyhow!(format!("error deserializing user data {}: {}", e, String::from_utf8_lossy(&resp_body))).into())
+                }
+            }
+        } else {
+            Err(anyhow!(format!("error getting user data {}: {}", resp_status.as_str(), String::from_utf8_lossy(&resp_body))).into())
+        }
+    }
+
+    async fn get_user_by_id(&self, user_id: String) -> Result<EmbyItemData, Error> {
+        let url = format!("Users/{user_id}");
+        let resp = self.do_emby_get(&url).await?;
+        let resp_status = resp.status();
+        let resp_body = resp.bytes().await?;
+        if resp_status.clone().is_success() {
+            match serde_json::from_slice::<EmbyItemData>(&resp_body) {
+                Ok(user) => {
+                    Ok(user)
+                }
+                Err(e) => {
+                    Err(anyhow!(format!("error deserializing user data {}: {}", e, String::from_utf8_lossy(&resp_body))).into())
+                }
+            }
+        } else {
+            Err(anyhow!(format!("error getting user data {}: {}", resp_status.as_str(), String::from_utf8_lossy(&resp_body))).into())
+        }
+    }
+
+    async fn user_stop_fn(&self, user_id: String, media_id: String) -> Arc<TokioMutex<Pin<Box<dyn Future<Output = bool> + Send>>>> {
+        let emby_client = self.clone();
+        Arc::new(TokioMutex::new(Box::pin(async move {
+                let url = format!("Users/{user_id}/PlayedItems/{media_id}");
+                let _resp = emby_client.do_emby_post(&url).await;
+                true
+        }) as Pin<Box<dyn Future<Output = bool> + Send>>))
     }
 }
 
