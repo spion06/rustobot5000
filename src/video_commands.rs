@@ -1,4 +1,5 @@
 use crate::{bot_error, embyclient::{EmbyClient, EmbyItemData, EmbySearch}, gstreamer::PlayQueue, BotError, Context, EmbySearchResult, Error, ShowSearch};
+use paginate::Pages;
 use poise::{serenity_prelude::{self as serenity, ComponentInteractionDataKind, CreateActionRow, CreateAttachment, CreateSelectMenuKind, CreateSelectMenuOption}, CreateReply};
 use uuid::Uuid;
 use std::str::FromStr;
@@ -215,6 +216,8 @@ pub async fn player(ctx: Context<'_>) -> Result<(), Error> {
     // using ctx.id here prevents issues with multiple bot instances
     let interaction_prefix = ctx.id();
     let mut current_user = None;
+    // current identifier to be used between iteractions
+    let mut id_context: Option<String> = None;
 
     let reply = {
         CreateReply::default()
@@ -411,7 +414,7 @@ pub async fn player(ctx: Context<'_>) -> Result<(), Error> {
             match get_seasons(ctx.data().emby_client.as_ref(), series_id).await {
                 Ok(seasons) => {
                     result_box.push(
-                        serenity::CreateActionRow::SelectMenu(serenity::CreateSelectMenu::new(format!("{}_season_result", interaction_prefix), seasons.result_box).placeholder(format!("{} Seasons", seasons.result_items))),
+                        serenity::CreateActionRow::SelectMenu(serenity::CreateSelectMenu::new(format!("{}_season_result", interaction_prefix), seasons.to_menu()).placeholder(format!("{} Seasons", seasons.result_items))),
                     );
                     message = format!("Found {} Seasons", seasons.result_items);
                 }
@@ -438,19 +441,8 @@ pub async fn player(ctx: Context<'_>) -> Result<(), Error> {
                 ctx,
                 serenity::EditMessage::new().content(format!("Got Season {}", season_id))
             ).await?;
-            let mut result_box: Vec<CreateActionRow> = vec![];
-            let mut message: String = "No results found".to_string();
-            match get_episodes(ctx.data().emby_client.as_ref(), season_id, &current_user).await {
-                Ok(seasons) => {
-                    result_box.push(
-                        serenity::CreateActionRow::SelectMenu(serenity::CreateSelectMenu::new(format!("{}_episodes_result", interaction_prefix), seasons.result_box).placeholder(format!("{} Series Episodes", seasons.result_items))),
-                    );
-                    message = format!("Found {} Episodes", seasons.result_items);
-                }
-                Err(e) => {
-                    message = format!("Error getting episodes: {}", e);
-                }
-            }
+            let (result_box, message) = handle_episode_search(interaction_prefix.to_string(), season_id, &current_user, ctx, 1).await;
+            id_context = Some(season_id.to_string());
             msg.edit(
                 ctx,
                 serenity::EditMessage::new().content(message).components(get_buttons(interaction_prefix.to_string(), &current_user, Some(result_box)).await)
@@ -467,39 +459,74 @@ pub async fn player(ctx: Context<'_>) -> Result<(), Error> {
                 }
             };
             let mut message: String = "No results found".to_string();
-            let episode_info = ctx.data().emby_client.as_ref().get_episode_info(episode_id).await?;
-            let episode_path = match episode_info.clone().path {
-                Some(path) => path,
-                None => "".to_string(),
-            };
-            if episode_path.is_empty() {
-                message = format!("could not find episode info for {}", episode_info.name);
-                error!(message)
+
+            if episode_id.starts_with("page_") {
+                let extracted_page = episode_id.split("_").last();
+                match extracted_page {
+                    Some(p) => {
+                        let page_num: u32 = p.parse().expect("unable to parse page number");
+                        match id_context.clone() {
+                            Some(season_id) => {
+                                let (result_box, message) = handle_episode_search(interaction_prefix.to_string(), season_id.as_str(), &current_user, ctx, page_num).await;
+                                msg.edit(
+                                    ctx,
+                                    serenity::EditMessage::new().content(message).components(get_buttons(interaction_prefix.to_string(), &current_user, Some(result_box)).await)
+                                ).await?;
+                            },
+                            None => {
+                                message = "no season id found when getting next page! this is a bug!".to_string();
+                                error!(message);
+                                msg.edit(
+                                    ctx,
+                                    serenity::EditMessage::new().content(message)
+                                ).await?
+                            }
+                        }
+                    }
+                    None => {
+                        message = "could not extract page id! this is a bug!".to_string();
+                        error!(message);
+                        msg.edit(
+                            ctx,
+                            serenity::EditMessage::new().content(message)
+                        ).await?
+                    }
+                }
             } else {
+                let episode_info = ctx.data().emby_client.as_ref().get_episode_info(episode_id).await?;
+                let episode_path = match episode_info.clone().path {
+                    Some(path) => path,
+                    None => "".to_string(),
+                };
+                if episode_path.is_empty() {
+                    message = format!("could not find episode info for {}", episode_info.name);
+                    error!(message)
+                } else {
+                    msg.edit(
+                        ctx,
+                        serenity::EditMessage::new().content(format!("Got episode {}", episode_path))
+                    ).await?;
+                    let episode_path = episode_path.replace("/mnt/storage", "/mnt/zfspool/storage");
+                    let stop_fn = match &current_user {
+                        Some(u) => Some(ctx.data().emby_client.as_ref().user_stop_fn(u.id.clone(), episode_info.id.clone()).await),
+                        None => None,
+                    };
+                    match &pipeline_ref.add_uri(episode_path.to_string(), generate_episode_name(episode_info.clone()), stop_fn) {
+                        Ok(i) => {
+                            message = format!("added {} to queue", i.name());
+                        }
+                        Err(e) => {
+                            message = format!("error adding {} to queue: {}", episode_path, e);
+                            error!(message)
+                        }
+                        
+                    };
+                };
                 msg.edit(
                     ctx,
-                    serenity::EditMessage::new().content(format!("Got episode {}", episode_path))
+                    serenity::EditMessage::new().content(message)
                 ).await?;
-                let episode_path = episode_path.replace("/mnt/storage", "/mnt/zfspool/storage");
-                let stop_fn = match &current_user {
-                    Some(u) => Some(ctx.data().emby_client.as_ref().user_stop_fn(u.id.clone(), episode_info.id.clone()).await),
-                    None => None,
-                };
-                match &pipeline_ref.add_uri(episode_path.to_string(), generate_episode_name(episode_info.clone()), stop_fn) {
-                    Ok(i) => {
-                        message = format!("added {} to queue", i.name());
-                    }
-                    Err(e) => {
-                        message = format!("error adding {} to queue: {}", episode_path, e);
-                        error!(message)
-                    }
-                    
-                };
-            };
-            msg.edit(
-                ctx,
-                serenity::EditMessage::new().content(message)
-            ).await?;
+            }
         }
 
         // handle result from clicking on select user
@@ -513,7 +540,7 @@ pub async fn player(ctx: Context<'_>) -> Result<(), Error> {
             match get_users(ctx.data().emby_client.as_ref()).await {
                 Ok(seasons) => {
                     result_box.push(
-                        serenity::CreateActionRow::SelectMenu(serenity::CreateSelectMenu::new(format!("{}_user_list_result", interaction_prefix), seasons.result_box).placeholder(format!("{} Users", seasons.result_items))),
+                        serenity::CreateActionRow::SelectMenu(serenity::CreateSelectMenu::new(format!("{}_user_list_result", interaction_prefix), seasons.to_menu()).placeholder(format!("{} Users", seasons.result_items))),
                     );
                     message = format!("Found {} Users", seasons.result_items);
                 }
@@ -573,7 +600,7 @@ pub async fn player(ctx: Context<'_>) -> Result<(), Error> {
                                         )
                                     } else {
                                         result_box.push(
-                                            serenity::CreateActionRow::SelectMenu(serenity::CreateSelectMenu::new(format!("{}_series_result", interaction_prefix), list.result_box).placeholder("Series Search Results")),
+                                            serenity::CreateActionRow::SelectMenu(serenity::CreateSelectMenu::new(format!("{}_series_result", interaction_prefix), list.to_menu()).placeholder("Series Search Results")),
                                         )
                                     }
                                     message = format!("Found {} results", list.result_items);
@@ -628,8 +655,7 @@ async fn get_series(emby_client: &EmbyClient, series_name: &str) -> Result<EmbyS
       .collect();
     let menu_item_count = menu_options.len();
     info!("found {} series", menu_item_count.clone());
-    let row = serenity::CreateSelectMenuKind::String { options: menu_options };
-    Ok( EmbySearchResult { result_box: row, result_items: menu_item_count} )
+    Ok( EmbySearchResult { result_menu_option: menu_options, result_items: menu_item_count} )
 }
 
 async fn get_users(emby_client: &EmbyClient) -> Result<EmbySearchResult, Error> {
@@ -643,8 +669,7 @@ async fn get_users(emby_client: &EmbyClient) -> Result<EmbySearchResult, Error> 
     let menu_options: Vec<CreateSelectMenuOption> = vec![CreateSelectMenuOption::new("None", "None")].iter().chain(menu_options.iter()).cloned().collect();
     let menu_item_count = menu_options.len();
     info!("found {} users", menu_item_count.clone());
-    let row = serenity::CreateSelectMenuKind::String { options: menu_options };
-    Ok( EmbySearchResult { result_box: row, result_items: menu_item_count} )
+    Ok( EmbySearchResult { result_menu_option: menu_options, result_items: menu_item_count} )
 }
 
 async fn get_now_playing(pipeline_ref: &PlayQueue) -> String {
@@ -668,8 +693,7 @@ async fn get_seasons(emby_client: &EmbyClient, series_id: &str) -> Result<EmbySe
       })
       .collect();
     let menu_item_count = menu_options.len();
-    let row = serenity::CreateSelectMenuKind::String { options: menu_options };
-    Ok( EmbySearchResult { result_box: row, result_items: menu_item_count} )
+    Ok( EmbySearchResult { result_menu_option: menu_options, result_items: menu_item_count} )
 }
 
 fn generate_episode_name(episode: EmbyItemData) -> String {
@@ -686,6 +710,62 @@ fn generate_episode_name(episode: EmbyItemData) -> String {
     format!("{}S{}E{} - {}", watched_icon, episode.season_num.as_ref().unwrap(), episode.episode_num.as_ref().unwrap(), episode.name)
 }
 
+fn paginate_result(search_result: EmbySearchResult, page_number: u32) -> Result<EmbySearchResult, Error> {
+    let page_number_idx = if page_number > 0 {
+        page_number - 1
+    } else {
+        page_number
+    };
+    if search_result.result_items > 25 {
+        // 23 pages so there is an item for previous/next page
+        let pages = Pages::new(search_result.result_items, 23);
+        let mut menu_options: Vec<CreateSelectMenuOption> = vec![];
+        if page_number > 1 {
+            let prev_page = page_number - 1;
+            menu_options.push(CreateSelectMenuOption::new(format!("Back Page: {}", prev_page), format!("page_{}", prev_page)));
+        }
+        if page_number as usize > pages.page_count() {
+            return Err(Box::new(BotError::new(format!("Page {} is outside of the valid max of {}", page_number, pages.page_count()).as_str())))
+        }
+        let page = pages.with_offset(page_number_idx as usize);
+        for idx in page.start..=page.end {
+            let option = search_result.result_menu_option.get(idx);
+            match option {
+               Some(i) => menu_options.push(i.clone()),
+               None => { return Err(Box::new(BotError::new("unable to get page item. out of range"))) }
+            }
+        }
+        if page_number as usize != pages.page_count() {
+            let next_page = page_number + 1;
+            menu_options.push(CreateSelectMenuOption::new(format!("Next Page: {}", next_page), format!("page_{}", next_page)));
+        }
+
+        let result = EmbySearchResult { result_menu_option: menu_options, result_items: search_result.result_items};
+
+        Ok(result)
+    } else {
+        return Ok(search_result)
+    }
+}
+
+async fn handle_episode_search(interaction_prefix: String, season_id: &str, current_user: &Option<EmbyItemData>, ctx: Context<'_>, page_number: u32) -> (Vec<CreateActionRow>, String) {
+    let mut message: String = "no result found".to_string();
+    let mut result_box: Vec<CreateActionRow> = vec![];
+    match get_episodes(ctx.data().emby_client.as_ref(), season_id, &current_user).await {
+        Ok(episodes) => {
+            let paged_result = paginate_result(episodes, page_number).expect("Unable to paginate result");
+            result_box.push(
+                serenity::CreateActionRow::SelectMenu(serenity::CreateSelectMenu::new(format!("{}_episodes_result", interaction_prefix), paged_result.to_menu()).placeholder(format!("{} Series Episodes", paged_result.result_items))),
+            );
+            message = paged_result.to_msg(Some("episodes"));
+        }
+        Err(e) => {
+            message = format!("Error getting episodes: {}", e);
+        }
+    }
+    return (result_box, message);
+}
+
 async fn get_episodes(emby_client: &EmbyClient, season_id: &str, current_user: &Option<EmbyItemData>) -> Result<EmbySearchResult, Error> {
     let episode_result = match emby_client.get_episodes_for_season(season_id, current_user).await {
         Ok(d) => Ok(d),
@@ -696,7 +776,9 @@ async fn get_episodes(emby_client: &EmbyClient, season_id: &str, current_user: &
       .map(|episode| {
         match &episode.path {
             Some(_episode_path) => {
-                let label = generate_episode_name(episode.clone());
+                let mut label = generate_episode_name(episode.clone());
+                // label must be under 25 characters so truncate the label name
+                label.truncate(25);
                 CreateSelectMenuOption::new(label, episode.id.as_str())
             }
             None => {
@@ -706,8 +788,7 @@ async fn get_episodes(emby_client: &EmbyClient, season_id: &str, current_user: &
       })
       .collect();
     let menu_item_count = menu_options.len();
-    let row = serenity::CreateSelectMenuKind::String { options: menu_options };
-    Ok( EmbySearchResult { result_box: row, result_items: menu_item_count} )
+    Ok( EmbySearchResult { result_menu_option: menu_options, result_items: menu_item_count} )
 }
 
 async fn get_queue_selector(pipeline_ref: &PlayQueue, prefix: &str) -> Vec<CreateActionRow> {

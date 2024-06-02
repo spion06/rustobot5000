@@ -17,6 +17,7 @@ gstreamer-pbutils = { version = "0.22.0", features = ["v1_20"] }
 gstreamer-video = { version = "0.22.1", features = ["v1_20"] }
 k8s-openapi = { version = "0.21.0", features = ["v1_27"] }
 kube = "0.88.1"
+paginate = "1.1.11"
 percent-encoding = "2.3.1"
 poise = "0.6.1"
 reqwest = { version = "0.12.2", features = ["json", "rustls-tls", "h2", "http2"], default-features = false }

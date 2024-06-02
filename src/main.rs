@@ -1,7 +1,7 @@
 use embyclient::EmbyClient;
 use k8s_openapi::api::apps::v1::Deployment;
 use kube::{Api, Client as KubeClient};
-use poise::{samples::HelpConfiguration, serenity_prelude::{self as serenity, CreateSelectMenuKind}, FrameworkError};
+use poise::{samples::HelpConfiguration, serenity_prelude::{self as serenity, CreateSelectMenuKind, CreateSelectMenuOption}, FrameworkError};
 use std::{fmt, sync::Arc};
 use tracing::{info, error};
 use tracing_subscriber;
@@ -25,9 +25,23 @@ struct BotError {
     details: String,
 }
 
+#[derive(Clone)]
 struct EmbySearchResult {
-    result_box: CreateSelectMenuKind,
+    result_menu_option: Vec<CreateSelectMenuOption>,
     result_items: usize,
+}
+
+impl EmbySearchResult {
+    pub fn to_menu(&self) -> CreateSelectMenuKind {
+        serenity::CreateSelectMenuKind::String { options: self.result_menu_option.clone()}
+    }
+    pub fn to_msg(&self, result_type: Option<&str>) -> String {
+        let type_name = match result_type {
+            Some(t) => t,
+            None => "items",
+        };
+        format!("found {} {}", self.result_items, type_name)
+    }
 }
 
 impl BotError {

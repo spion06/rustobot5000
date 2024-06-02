@@ -48,6 +48,18 @@ struct EmbyItemsResult {
     items: Vec<EmbyItemData>
 }
 
+impl EmbyItemsResult {
+    pub fn get_sorted_items(&self) -> Vec<EmbyItemData> {
+        let mut items = self.items.clone();
+        items.sort_by(|a, b| {
+            let a_int : u32 = a.episode_num.clone().unwrap_or("0".to_string()).parse().unwrap_or(0);
+            let b_int : u32 = b.episode_num.clone().unwrap_or("0".to_string()).parse().unwrap_or(0);
+            a_int.cmp(&b_int)
+        });
+        items
+    }
+}
+
 pub(crate) trait EmbySearch {
     async fn search_series(&self, series_name: &str) -> Result<Vec<EmbyItemData>, Error>;
     async fn get_seasons_for_series(&self, series_id: &str) -> Result<Vec<EmbyItemData>, Error>;
@@ -151,7 +163,7 @@ impl EmbySearch for EmbyClient {
         if resp_status.clone().is_success() {
             match serde_json::from_slice::<EmbyItemsResult>(&resp_body) {
                 Ok(series) => {
-                    Ok(series.items)
+                    Ok(series.get_sorted_items())
                 }
                 Err(e) => {
                     Err(anyhow!(format!("error deserializing data {}: {}", e, String::from_utf8_lossy(&resp_body))).into())
