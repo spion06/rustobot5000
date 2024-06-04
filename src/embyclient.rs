@@ -3,6 +3,7 @@ use reqwest::{self, Response};
 use serde::{Deserialize, Deserializer};
 use serde::de::{self, Visitor};
 
+use strum::{Display, EnumIter, EnumString};
 use url::Url;
 use anyhow::{Error, anyhow};
 use tracing::{info, error};
@@ -20,6 +21,8 @@ pub(crate) struct EmbyItemData {
     pub(crate) id: String,
     #[serde(rename = "Name")]
     pub(crate) name: String,
+    #[serde(rename = "Type")]
+    pub(crate) item_type: String,
     #[serde(rename = "Path")]
     pub(crate) path: Option<String>,
     #[serde(default, rename = "IndexNumber", deserialize_with = "deserialize_option_string_or_int")]
@@ -28,6 +31,15 @@ pub(crate) struct EmbyItemData {
     pub(crate) season_num: Option<String>,
     #[serde(default, rename = "UserData")]
     pub(crate) user_data: Option<EmbyItemUserData>,
+}
+
+#[derive(Debug, EnumString, Display, Default, EnumIter)]
+pub(crate) enum SearchItemType {
+    #[default]
+    #[strum(ascii_case_insensitive)]
+    Series,
+    #[strum(ascii_case_insensitive)]
+    Movie,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -61,11 +73,14 @@ impl EmbyItemsResult {
 }
 
 pub(crate) trait EmbySearch {
+    async fn search_items(&self, item_name: &str, item_type: Vec<SearchItemType>) -> Result<Vec<EmbyItemData>, Error>;
     async fn search_series(&self, series_name: &str) -> Result<Vec<EmbyItemData>, Error>;
+    async fn search_movies(&self, movie_name: &str) -> Result<Vec<EmbyItemData>, Error>;
     async fn get_seasons_for_series(&self, series_id: &str) -> Result<Vec<EmbyItemData>, Error>;
     async fn get_episodes_for_season(&self, season_id: &str, user: &Option<EmbyItemData>) -> Result<Vec<EmbyItemData>, Error>;
-    async fn get_episode_info(&self, episode_id: &str) -> Result<EmbyItemData, Error>;
+    async fn get_item_info(&self, episode_id: &str) -> Result<EmbyItemData, Error>;
     async fn get_all_series(&self) -> Result<Vec<EmbyItemData>, Error>;
+    async fn get_all_movies(&self) -> Result<Vec<EmbyItemData>, Error>;
     async fn get_users(&self) -> Result<Vec<EmbyItemData>, Error>;
     async fn get_user_by_id(&self, user_id: String) -> Result<EmbyItemData, Error>;
     async fn user_stop_fn(&self, user_id: String, media_id: String) -> Arc<TokioMutex<Pin<Box<dyn Future<Output = bool> + Send>>>>;
@@ -113,8 +128,12 @@ impl EmbyClient {
 }
 
 impl EmbySearch for EmbyClient {
-    async fn search_series(&self, series_name: &str) -> Result<Vec<EmbyItemData>, Error> {
-        let url = format!("Items?Recursive=true&IncludeItemTypes=Series&SortBy=SortName&SearchTerm={}", series_name);
+    async fn search_items(&self, item_name: &str, item_types: Vec<SearchItemType>) -> Result<Vec<EmbyItemData>, Error> {
+        if item_name.len() == 0 {
+            return Err(anyhow!("no item types for search passed!"))
+        }
+        let item_types = item_types.iter().map(|i| i.to_string()).collect::<Vec<String>>().join(",");
+        let url = format!("Items?Recursive=true&IncludeItemTypes={}&SortBy=SortName&SearchTerm={}", item_types, item_name);
         let resp = self.do_emby_get(&url).await?;
         let resp_status = resp.status();
         let resp_body = resp.bytes().await?;
@@ -131,7 +150,15 @@ impl EmbySearch for EmbyClient {
             Err(anyhow!(format!("error getting data {}: {}", resp_status.as_str(), String::from_utf8_lossy(&resp_body))).into())
         }
     }
-    
+
+    async fn search_series(&self, series_name: &str) -> Result<Vec<EmbyItemData>, Error> {
+        self.search_items(series_name, vec![SearchItemType::Series]).await
+    }
+
+    async fn search_movies(&self, series_name: &str) -> Result<Vec<EmbyItemData>, Error> {
+        self.search_items(series_name, vec![SearchItemType::Movie]).await
+    }
+
     async fn get_seasons_for_series(&self, series_id: &str) -> Result<Vec<EmbyItemData>, Error> {
         let url = format!("Shows/{}/Seasons", series_id);
         let resp = self.do_emby_get(&url).await?;
@@ -174,8 +201,8 @@ impl EmbySearch for EmbyClient {
         }
     }
 
-    async fn get_episode_info(&self, episode_id: &str) -> Result<EmbyItemData, Error> {
-        let url = format!("Items?Ids={}&Fields=Path&IsMissing=false&SortBy=PremiereDate", episode_id);
+    async fn get_item_info(&self, item_id: &str) -> Result<EmbyItemData, Error> {
+        let url = format!("Items?Ids={}&Fields=Path&IsMissing=false&SortBy=PremiereDate", item_id);
         let resp = self.do_emby_get(&url).await?;
         let resp_status = resp.status();
         let resp_body = resp.bytes().await?;
@@ -187,7 +214,7 @@ impl EmbySearch for EmbyClient {
                             Ok(episode.clone())
                         }
                         None => {
-                            let err_msg = format!("Somehow could not find item id {}", episode_id);
+                            let err_msg = format!("Somehow could not find item id {}", item_id);
                             error!(err_msg);
                             Err(anyhow!(err_msg))
                         }
@@ -201,8 +228,28 @@ impl EmbySearch for EmbyClient {
             Err(anyhow!(format!("error getting data {}: {}", resp_status.as_str(), String::from_utf8_lossy(&resp_body))).into())
         }
     }
+
     async fn get_all_series(&self) -> Result<Vec<EmbyItemData>, Error> {
         let url = "Items?Recursive=true&IncludeItemTypes=Series&SortBy=SortName";
+        let resp = self.do_emby_get(&url).await?;
+        let resp_status = resp.status();
+        let resp_body = resp.bytes().await?;
+        if resp_status.clone().is_success() {
+            match serde_json::from_slice::<EmbyItemsResult>(&resp_body) {
+                Ok(series) => {
+                    Ok(series.items)
+                }
+                Err(e) => {
+                    Err(anyhow!(format!("error deserializing data {}: {}", e, String::from_utf8_lossy(&resp_body))).into())
+                }
+            }
+        } else {
+            Err(anyhow!(format!("error getting data {}: {}", resp_status.as_str(), String::from_utf8_lossy(&resp_body))).into())
+        }
+    }
+
+    async fn get_all_movies(&self) -> Result<Vec<EmbyItemData>, Error> {
+        let url = "Items?Recursive=true&IncludeItemTypes=Movie&SortBy=SortName";
         let resp = self.do_emby_get(&url).await?;
         let resp_status = resp.status();
         let resp_body = resp.bytes().await?;

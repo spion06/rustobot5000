@@ -1,4 +1,4 @@
-use embyclient::EmbyClient;
+use embyclient::{EmbyClient};
 use k8s_openapi::api::apps::v1::Deployment;
 use kube::{Api, Client as KubeClient};
 use poise::{samples::HelpConfiguration, serenity_prelude::{self as serenity, CreateSelectMenuKind, CreateSelectMenuOption}, FrameworkError};
@@ -17,6 +17,7 @@ extern crate gstreamer as gst;
 #[allow(dead_code)]
 struct ShowSearch {
     show_name: String,
+    search_type: String,
 }
 
 // Define a custom error type

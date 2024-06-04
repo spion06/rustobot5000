@@ -1,12 +1,14 @@
-use crate::{bot_error, embyclient::{EmbyClient, EmbyItemData, EmbySearch}, gstreamer::PlayQueue, BotError, Context, EmbySearchResult, Error, ShowSearch};
+use crate::{bot_error, embyclient::{EmbyClient, EmbyItemData, EmbySearch, SearchItemType}, gstreamer::PlayQueue, BotError, Context, EmbySearchResult, Error, ShowSearch};
+
 use paginate::Pages;
-use poise::{serenity_prelude::{self as serenity, ComponentInteractionDataKind, CreateActionRow, CreateAttachment, CreateSelectMenuKind, CreateSelectMenuOption}, CreateReply};
+use poise::{serenity_prelude::{self as serenity, ComponentInteractionDataKind, CreateActionRow, CreateAttachment, CreateSelectMenuKind, CreateSelectMenuOption}, CreateReply, Modal};
+use strum::IntoEnumIterator;
 use uuid::Uuid;
 use std::str::FromStr;
 use tracing::{info, error, warn};
 
 
-#[poise::command(slash_command, default_member_permissions = "ADMINISTRATOR", subcommands("add", "play", "pause", "stop", "skip", "list_series", "player", "seek"), subcommand_required)]
+#[poise::command(slash_command, default_member_permissions = "ADMINISTRATOR", subcommands("add", "play", "pause", "stop", "skip", "list_series", "list_movies", "player", "seek"), subcommand_required)]
 pub(crate) async fn rusto_video(_: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
@@ -211,6 +213,18 @@ async fn list_series(
     Ok(())
 }
 
+#[poise::command(slash_command, default_member_permissions = "ADMINISTRATOR")]
+async fn list_movies(
+    ctx: Context<'_>,
+) -> Result<(), Error> {
+    let emby_client = ctx.data().emby_client.as_ref();
+    let series_list = emby_client.get_all_movies().await?.iter().map(|f| f.name.clone()).collect::<Vec<String>>().join("\n");
+    let attachment_name = "all_series.csv";
+    let attachment_logs = CreateAttachment::bytes(series_list.as_bytes(), attachment_name);
+    ctx.send(CreateReply::default().attachment(attachment_logs)).await?;
+    Ok(())
+}
+
 #[poise::command(prefix_command, track_edits, slash_command)]
 pub async fn player(ctx: Context<'_>) -> Result<(), Error> {
     // using ctx.id here prevents issues with multiple bot instances
@@ -397,29 +411,48 @@ pub async fn player(ctx: Context<'_>) -> Result<(), Error> {
         }
 
         // handle result from clicking on a series
-        if mci.data.custom_id.ends_with("series_result") {
-            let series_id = match &mci.data.kind {
+        if mci.data.custom_id.ends_with("first_item_result") {
+            let item_id_w_type = match &mci.data.kind {
                 ComponentInteractionDataKind::StringSelect { values } => &values[0],
                 k => {
                     warn!("got an unknown selection kind on series {:#?}", k);
                     "unknown"
                 }
             };
+            let parts = item_id_w_type.split("_").into_iter().map(|t| t.to_string()).collect::<Vec<String>>();
+            let result_type = match parts.get(0) {
+                Some(p) => p.clone(),
+                None => "unknown".to_string(),
+            };
+            let result_id = match parts.get(1) {
+                Some(p) => p.clone(),
+                None => "unknown".to_string(),
+            };
             msg.edit(
                 ctx,
-                serenity::EditMessage::new().content(format!("Got series {}", series_id))
+                serenity::EditMessage::new().content(format!("Got {} {}", result_type, result_id))
             ).await?;
             let mut result_box: Vec<CreateActionRow> = vec![];
             let mut message: String = "No results found".to_string();
-            match get_seasons(ctx.data().emby_client.as_ref(), series_id).await {
-                Ok(seasons) => {
-                    result_box.push(
-                        serenity::CreateActionRow::SelectMenu(serenity::CreateSelectMenu::new(format!("{}_season_result", interaction_prefix), seasons.to_menu()).placeholder(format!("{} Seasons", seasons.result_items))),
-                    );
-                    message = format!("Found {} Seasons", seasons.result_items);
+            match result_type.as_str() {
+                "series" => {
+                    match get_seasons(ctx.data().emby_client.as_ref(), &result_id).await {
+                        Ok(seasons) => {
+                            result_box.push(
+                                serenity::CreateActionRow::SelectMenu(serenity::CreateSelectMenu::new(format!("{}_season_result", interaction_prefix), seasons.to_menu()).placeholder(format!("{} Seasons", seasons.result_items))),
+                            );
+                            message = format!("Found {} Seasons", seasons.result_items);
+                        }
+                        Err(e) => {
+                            message = format!("Error getting seasons: {}", e);
+                        }
+                    }
                 }
-                Err(e) => {
-                    message = format!("Error getting seasons: {}", e);
+                "movie" => {
+                    message = add_emby_item(ctx, &mut pipeline_ref, &result_id, &current_user).await?
+                }
+                v => {
+                    message = format!("unknown item {}", v)
                 }
             }
             msg.edit(
@@ -493,35 +526,7 @@ pub async fn player(ctx: Context<'_>) -> Result<(), Error> {
                     }
                 }
             } else {
-                let episode_info = ctx.data().emby_client.as_ref().get_episode_info(episode_id).await?;
-                let episode_path = match episode_info.clone().path {
-                    Some(path) => path,
-                    None => "".to_string(),
-                };
-                if episode_path.is_empty() {
-                    message = format!("could not find episode info for {}", episode_info.name);
-                    error!(message)
-                } else {
-                    msg.edit(
-                        ctx,
-                        serenity::EditMessage::new().content(format!("Got episode {}", episode_path))
-                    ).await?;
-                    let episode_path = episode_path.replace("/mnt/storage", "/mnt/zfspool/storage");
-                    let stop_fn = match &current_user {
-                        Some(u) => Some(ctx.data().emby_client.as_ref().user_stop_fn(u.id.clone(), episode_info.id.clone()).await),
-                        None => None,
-                    };
-                    match &pipeline_ref.add_uri(episode_path.to_string(), generate_episode_name(episode_info.clone()), stop_fn) {
-                        Ok(i) => {
-                            message = format!("added {} to queue", i.name());
-                        }
-                        Err(e) => {
-                            message = format!("error adding {} to queue: {}", episode_path, e);
-                            error!(message)
-                        }
-                        
-                    };
-                };
+                let message = add_emby_item(ctx, &mut pipeline_ref, episode_id, &current_user).await?;
                 msg.edit(
                     ctx,
                     serenity::EditMessage::new().content(message)
@@ -583,7 +588,11 @@ pub async fn player(ctx: Context<'_>) -> Result<(), Error> {
                 ctx,
                 serenity::EditMessage::new().content("Waiting for user input...")
             ).await?;
-            let data = poise::execute_modal_on_component_interaction::<ShowSearch>(ctx, mci.clone(), None, Some(std::time::Duration::from_secs(30))).await;
+            let default_input = ShowSearch {
+                search_type: SearchItemType::iter().map(|i| i.to_string()).collect::<Vec<String>>().join(","),
+                show_name: "".to_string(),
+            };
+            let data = poise::execute_modal_on_component_interaction::<ShowSearch>(ctx, mci.clone(), Some(default_input), Some(std::time::Duration::from_secs(30))).await;
             let mut result_box: Vec<CreateActionRow> = vec![];
             let mut message: String = "No results or input timeout found".to_string();
             match &data {
@@ -591,16 +600,23 @@ pub async fn player(ctx: Context<'_>) -> Result<(), Error> {
                     send_final = false;
                     match d {
                         Some(user_search) => {
-                            match get_series(ctx.data().emby_client.as_ref(), &user_search.show_name).await {
+                            let mut search_types = vec![];
+                            for s_type in user_search.search_type.split(",") {
+                                match SearchItemType::from_str(s_type) {
+                                    Ok(v) => search_types.push(v),
+                                    Err(e) => error!("invalid search item type {}: {}", s_type, e)
+                                }
+                            }
+                            match get_items(ctx.data().emby_client.as_ref(), &user_search.show_name, search_types).await {
                                 Ok(list) => {
                                     if list.result_items == 0 {
                                         let empty_result = CreateSelectMenuKind::String { options: vec![CreateSelectMenuOption::new("No Results found!", "empty")] };
                                         result_box.push(
-                                            serenity::CreateActionRow::SelectMenu(serenity::CreateSelectMenu::new(format!("{}_series_result", interaction_prefix), empty_result).placeholder("Series Search Results")),
+                                            serenity::CreateActionRow::SelectMenu(serenity::CreateSelectMenu::new(format!("{}_first_item_result", interaction_prefix), empty_result).placeholder("Search Results")),
                                         )
                                     } else {
                                         result_box.push(
-                                            serenity::CreateActionRow::SelectMenu(serenity::CreateSelectMenu::new(format!("{}_series_result", interaction_prefix), list.to_menu()).placeholder("Series Search Results")),
+                                            serenity::CreateActionRow::SelectMenu(serenity::CreateSelectMenu::new(format!("{}_first_item_result", interaction_prefix), list.to_menu()).placeholder("Search Results")),
                                         )
                                     }
                                     message = format!("Found {} results", list.result_items);
@@ -635,14 +651,45 @@ pub async fn player(ctx: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
-async fn get_series(emby_client: &EmbyClient, series_name: &str) -> Result<EmbySearchResult, Error> {
-    let series_result = if series_name == "all" {
+async fn add_emby_item(ctx: Context<'_>, pipeline_ref: &mut PlayQueue, item_id: &str, current_user: &Option<EmbyItemData>) -> Result<String, Error> {
+    let mut message = "nothing".to_string();
+    let episode_info = ctx.data().emby_client.as_ref().get_item_info(item_id).await?;
+    let episode_path = match episode_info.clone().path {
+        Some(path) => path,
+        None => "".to_string(),
+    };
+    if episode_path.is_empty() {
+        message = format!("could not find episode info for {}", episode_info.name);
+        error!(message)
+    } else {
+        info!("Got episode {}", episode_path);
+        let episode_path = episode_path.replace("/mnt/storage", "/mnt/zfspool/storage");
+        let stop_fn = match &current_user {
+            Some(u) => Some(ctx.data().emby_client.as_ref().user_stop_fn(u.id.clone(), episode_info.id.clone()).await),
+            None => None,
+        };
+        match pipeline_ref.add_uri(episode_path.to_string(), generate_episode_name(episode_info.clone()), stop_fn) {
+            Ok(i) => {
+                message = format!("added {} to queue", i.name());
+            }
+            Err(e) => {
+                message = format!("error adding {} to queue: {}", episode_path, e);
+                error!(message)
+            }
+            
+        };
+    };
+    Ok(message.to_string())
+}
+
+async fn get_items(emby_client: &EmbyClient, item_name: &str, item_types: Vec<SearchItemType>) -> Result<EmbySearchResult, Error> {
+    let series_result = if item_name == "all" {
         match emby_client.get_all_series().await {
             Ok(d) => Ok(d),
             Err(e) => Err(Box::new(BotError::new(e.to_string().as_str())))
         }?
     } else {
-        match emby_client.search_series(series_name).await {
+        match emby_client.search_items(item_name, item_types).await {
             Ok(d) => Ok(d),
             Err(e) => Err(Box::new(BotError::new(e.to_string().as_str())))
         }?
@@ -650,7 +697,12 @@ async fn get_series(emby_client: &EmbyClient, series_name: &str) -> Result<EmbyS
     let menu_options: Vec<CreateSelectMenuOption> = series_result
       .iter()
       .map(|series| {
-        CreateSelectMenuOption::new(series.name.as_str(), series.id.to_string())
+        let (label_prefix, value_prefix) = match series.item_type.as_str() {
+            "Movie" => ("\u{1F4FD}", "movie"),
+            "Series" => ("\u{1F4FA}", "series"),
+            _ => ("unknown: ", "unknown"),
+        };
+        CreateSelectMenuOption::new(format!("{}: {}", label_prefix, series.name.as_str()), format!("{}_{}", value_prefix, series.id.to_string()))
       })
       .collect();
     let menu_item_count = menu_options.len();
@@ -707,7 +759,11 @@ fn generate_episode_name(episode: EmbyItemData) -> String {
         }
         None => "".to_string(),
     };
-    format!("{}S{}E{} - {}", watched_icon, episode.season_num.as_ref().unwrap(), episode.episode_num.as_ref().unwrap(), episode.name)
+    if episode.item_type == "Movie" {
+        format!("{}Movie - {}", watched_icon, episode.name)
+    } else {
+        format!("{}S{}E{} - {}", watched_icon, episode.season_num.as_ref().unwrap(), episode.episode_num.as_ref().unwrap(), episode.name)
+    }
 }
 
 fn paginate_result(search_result: EmbySearchResult, page_number: u32) -> Result<EmbySearchResult, Error> {
