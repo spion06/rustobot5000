@@ -22,7 +22,7 @@ pub(crate) struct EmbyItemData {
     #[serde(rename = "Name")]
     pub(crate) name: String,
     #[serde(rename = "Type")]
-    pub(crate) item_type: String,
+    pub(crate) item_type: Option<String>,
     #[serde(rename = "Path")]
     pub(crate) path: Option<String>,
     #[serde(default, rename = "IndexNumber", deserialize_with = "deserialize_option_string_or_int")]

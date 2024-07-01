@@ -547,10 +547,12 @@ pub async fn player(ctx: Context<'_>) -> Result<(), Error> {
                     result_box.push(
                         serenity::CreateActionRow::SelectMenu(serenity::CreateSelectMenu::new(format!("{}_user_list_result", interaction_prefix), seasons.to_menu()).placeholder(format!("{} Users", seasons.result_items))),
                     );
-                    message = format!("Found {} Users", seasons.result_items);
+                    message = seasons.to_msg(Some("User"));
+                    info!(message);
                 }
                 Err(e) => {
                     message = format!("Error getting users: {}", e);
+                    error!(message);
                 }
             }
             msg.edit(
@@ -697,7 +699,8 @@ async fn get_items(emby_client: &EmbyClient, item_name: &str, item_types: Vec<Se
     let menu_options: Vec<CreateSelectMenuOption> = series_result
       .iter()
       .map(|series| {
-        let (label_prefix, value_prefix) = match series.item_type.as_str() {
+        let item_type = series.item_type.clone().unwrap_or("Unknown".to_string());
+        let (label_prefix, value_prefix) = match item_type.as_str() {
             "Movie" => ("\u{1F4FD}", "movie"),
             "Series" => ("\u{1F4FA}", "series"),
             _ => ("unknown: ", "unknown"),
@@ -759,7 +762,7 @@ fn generate_episode_name(episode: EmbyItemData) -> String {
         }
         None => "".to_string(),
     };
-    if episode.item_type == "Movie" {
+    if episode.item_type.unwrap_or("Unknown".to_string()) == "Movie" {
         format!("{}Movie - {}", watched_icon, episode.name)
     } else {
         format!("{}S{}E{} - {}", watched_icon, episode.season_num.as_ref().unwrap(), episode.episode_num.as_ref().unwrap(), episode.name)
