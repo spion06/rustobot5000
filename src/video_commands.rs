@@ -837,7 +837,7 @@ async fn get_episodes(emby_client: &EmbyClient, season_id: &str, current_user: &
             Some(_episode_path) => {
                 let mut label = generate_episode_name(episode.clone());
                 // label must be under 25 characters so truncate the label name
-                label.truncate(25);
+                label.truncate(64);
                 CreateSelectMenuOption::new(label, episode.id.as_str())
             }
             None => {
