@@ -1,5 +1,5 @@
 # Stage 1: Build the binary
-FROM rust:1.98-bookworm AS builder
+FROM rust:1.98-trixie AS builder
 
 WORKDIR /usr/src/rustobot5000
 
@@ -29,7 +29,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cp target/x86_64-unknown-linux-gnu/release/rustobot5000 /rustobot5000-bin
 
 # Stage 2: Runtime image
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     ca-certificates \
