@@ -338,5 +338,5 @@ async fn main() {
     match shared_play_queue.clone().lock().await.stop_playback().await {
         Ok(_) => (),
         Err(e) => error!("error stopping pipeline {}", e)
-    }
+    };
 }
