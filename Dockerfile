@@ -1,10 +1,11 @@
 # Stage 1: Build the binary
-FROM rust:latest AS builder
+FROM rust:1.98-bookworm AS builder
 
 WORKDIR /usr/src/rustobot5000
 
 # Install build deps BEFORE copying source — this layer is cached across source changes
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake \
     libgstreamer1.0-dev \
     libgstreamer-plugins-base1.0-dev \
     gstreamer1.0-plugins-base \
@@ -28,7 +29,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cp target/x86_64-unknown-linux-gnu/release/rustobot5000 /rustobot5000-bin
 
 # Stage 2: Runtime image
-FROM debian:stable-slim
+FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     ca-certificates \
