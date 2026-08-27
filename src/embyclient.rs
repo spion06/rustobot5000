@@ -33,7 +33,7 @@ pub(crate) struct EmbyItemData {
     pub(crate) user_data: Option<EmbyItemUserData>,
 }
 
-#[derive(Debug, EnumString, Display, Default, EnumIter)]
+#[derive(Debug, Clone, EnumString, Display, Default, EnumIter)]
 pub(crate) enum SearchItemType {
     #[default]
     #[strum(ascii_case_insensitive)]
@@ -49,6 +49,7 @@ pub(crate) struct EmbyItemUserData {
 }
 
 #[derive(Deserialize, Debug)]
+#[allow(dead_code)]
 struct EmbySearchResult {
     #[serde(default, rename = "SearchHints")]
     search_hints: Vec<EmbyItemData>
@@ -64,8 +65,8 @@ impl EmbyItemsResult {
     pub fn get_sorted_items(&self) -> Vec<EmbyItemData> {
         let mut items = self.items.clone();
         items.sort_by(|a, b| {
-            let a_int : u32 = a.episode_num.clone().unwrap_or("0".to_string()).parse().unwrap_or(0);
-            let b_int : u32 = b.episode_num.clone().unwrap_or("0".to_string()).parse().unwrap_or(0);
+            let a_int: u32 = a.episode_num.as_deref().unwrap_or("0").parse().unwrap_or(0);
+            let b_int: u32 = b.episode_num.as_deref().unwrap_or("0").parse().unwrap_or(0);
             a_int.cmp(&b_int)
         });
         items
@@ -125,30 +126,49 @@ impl EmbyClient {
             }
         }
     }
+
+    /// Helper function to fetch and deserialize Emby API responses
+    async fn fetch_emby_items(&self, url: &str) -> Result<Vec<EmbyItemData>, Error> {
+        let resp = self.do_emby_get(url).await?;
+        let resp_status = resp.status();
+        let resp_body = resp.bytes().await?;
+        if resp_status.is_success() {
+            match serde_json::from_slice::<EmbyItemsResult>(&resp_body) {
+                Ok(result) => Ok(result.items),
+                Err(e) => Err(anyhow!("error deserializing data {}: {}", e, String::from_utf8_lossy(&resp_body)))
+            }
+        } else {
+            Err(anyhow!("error getting data {}: {}", resp_status.as_str(), String::from_utf8_lossy(&resp_body)))
+        }
+    }
+
+    /// Helper function to fetch sorted items (for episodes)
+    async fn fetch_emby_items_sorted(&self, url: &str) -> Result<Vec<EmbyItemData>, Error> {
+        let resp = self.do_emby_get(url).await?;
+        let resp_status = resp.status();
+        let resp_body = resp.bytes().await?;
+        if resp_status.is_success() {
+            match serde_json::from_slice::<EmbyItemsResult>(&resp_body) {
+                Ok(result) => Ok(result.get_sorted_items()),
+                Err(e) => Err(anyhow!("error deserializing data {}: {}", e, String::from_utf8_lossy(&resp_body)))
+            }
+        } else {
+            Err(anyhow!("error getting data {}: {}", resp_status.as_str(), String::from_utf8_lossy(&resp_body)))
+        }
+    }
 }
 
 impl EmbySearch for EmbyClient {
     async fn search_items(&self, item_name: &str, item_types: Vec<SearchItemType>) -> Result<Vec<EmbyItemData>, Error> {
-        if item_name.len() == 0 {
-            return Err(anyhow!("no item types for search passed!"))
+        if item_name.is_empty() {
+            return Err(anyhow!("no search term provided"))
         }
-        let item_types = item_types.iter().map(|i| i.to_string()).collect::<Vec<String>>().join(",");
-        let url = format!("Items?Recursive=true&IncludeItemTypes={}&SortBy=SortName&SearchTerm={}", item_types, item_name);
-        let resp = self.do_emby_get(&url).await?;
-        let resp_status = resp.status();
-        let resp_body = resp.bytes().await?;
-        if resp_status.clone().is_success() {
-            match serde_json::from_slice::<EmbyItemsResult>(&resp_body) {
-                Ok(series) => {
-                    Ok(series.items)
-                }
-                Err(e) => {
-                    Err(anyhow!(format!("error deserializing data {}: {}", e, String::from_utf8_lossy(&resp_body))).into())
-                }
-            }
-        } else {
-            Err(anyhow!(format!("error getting data {}: {}", resp_status.as_str(), String::from_utf8_lossy(&resp_body))).into())
+        if item_types.is_empty() {
+            return Err(anyhow!("no item types for search passed"))
         }
+        let item_types_str = item_types.iter().map(|i| i.to_string()).collect::<Vec<String>>().join(",");
+        let url = format!("Items?Recursive=true&IncludeItemTypes={}&SortBy=SortName&SearchTerm={}", item_types_str, item_name);
+        self.fetch_emby_items(&url).await
     }
 
     async fn search_series(&self, series_name: &str) -> Result<Vec<EmbyItemData>, Error> {
@@ -161,21 +181,7 @@ impl EmbySearch for EmbyClient {
 
     async fn get_seasons_for_series(&self, series_id: &str) -> Result<Vec<EmbyItemData>, Error> {
         let url = format!("Shows/{}/Seasons", series_id);
-        let resp = self.do_emby_get(&url).await?;
-        let resp_status = resp.status();
-        let resp_body = resp.bytes().await?;
-        if resp_status.clone().is_success() {
-            match serde_json::from_slice::<EmbyItemsResult>(&resp_body) {
-                Ok(series) => {
-                    Ok(series.items)
-                }
-                Err(e) => {
-                    Err(anyhow!(format!("error deserializing data {}: {}", e, String::from_utf8_lossy(&resp_body))).into())
-                }
-            }
-        } else {
-            Err(anyhow!(format!("error getting data {}: {}", resp_status.as_str(), String::from_utf8_lossy(&resp_body))).into())
-        }
+        self.fetch_emby_items(&url).await
     }
     
     async fn get_episodes_for_season(&self, season_id: &str, user: &Option<EmbyItemData>) -> Result<Vec<EmbyItemData>, Error> {
@@ -184,21 +190,7 @@ impl EmbySearch for EmbyClient {
             None => "".to_string(),
         };
         let url = format!("{}Items?ParentId={}&Fields=Path&IsMissing=false&SortBy=PremiereDate", url_prefix, season_id);
-        let resp = self.do_emby_get(&url).await?;
-        let resp_status = resp.status();
-        let resp_body = resp.bytes().await?;
-        if resp_status.clone().is_success() {
-            match serde_json::from_slice::<EmbyItemsResult>(&resp_body) {
-                Ok(series) => {
-                    Ok(series.get_sorted_items())
-                }
-                Err(e) => {
-                    Err(anyhow!(format!("error deserializing data {}: {}", e, String::from_utf8_lossy(&resp_body))).into())
-                }
-            }
-        } else {
-            Err(anyhow!(format!("error getting data {}: {}", resp_status.as_str(), String::from_utf8_lossy(&resp_body))).into())
-        }
+        self.fetch_emby_items_sorted(&url).await
     }
 
     async fn get_item_info(&self, item_id: &str) -> Result<EmbyItemData, Error> {
@@ -209,7 +201,7 @@ impl EmbySearch for EmbyClient {
         if resp_status.clone().is_success() {
             match serde_json::from_slice::<EmbyItemsResult>(&resp_body) {
                 Ok(episodes) => {
-                    match episodes.items.get(0) {
+                    match episodes.items.first() {
                         Some(episode) => {
                             Ok(episode.clone())
                         }
@@ -221,69 +213,24 @@ impl EmbySearch for EmbyClient {
                     }
                 }
                 Err(e) => {
-                    Err(anyhow!(format!("error deserializing data {}: {}", e, String::from_utf8_lossy(&resp_body))).into())
+                    Err(anyhow!("error deserializing data {}: {}", e, String::from_utf8_lossy(&resp_body)))
                 }
             }
         } else {
-            Err(anyhow!(format!("error getting data {}: {}", resp_status.as_str(), String::from_utf8_lossy(&resp_body))).into())
+            Err(anyhow!("error getting data {}: {}", resp_status.as_str(), String::from_utf8_lossy(&resp_body)))
         }
     }
 
     async fn get_all_series(&self) -> Result<Vec<EmbyItemData>, Error> {
-        let url = "Items?Recursive=true&IncludeItemTypes=Series&SortBy=SortName";
-        let resp = self.do_emby_get(&url).await?;
-        let resp_status = resp.status();
-        let resp_body = resp.bytes().await?;
-        if resp_status.clone().is_success() {
-            match serde_json::from_slice::<EmbyItemsResult>(&resp_body) {
-                Ok(series) => {
-                    Ok(series.items)
-                }
-                Err(e) => {
-                    Err(anyhow!(format!("error deserializing data {}: {}", e, String::from_utf8_lossy(&resp_body))).into())
-                }
-            }
-        } else {
-            Err(anyhow!(format!("error getting data {}: {}", resp_status.as_str(), String::from_utf8_lossy(&resp_body))).into())
-        }
+        self.fetch_emby_items("Items?Recursive=true&IncludeItemTypes=Series&SortBy=SortName").await
     }
 
     async fn get_all_movies(&self) -> Result<Vec<EmbyItemData>, Error> {
-        let url = "Items?Recursive=true&IncludeItemTypes=Movie&SortBy=SortName";
-        let resp = self.do_emby_get(&url).await?;
-        let resp_status = resp.status();
-        let resp_body = resp.bytes().await?;
-        if resp_status.clone().is_success() {
-            match serde_json::from_slice::<EmbyItemsResult>(&resp_body) {
-                Ok(series) => {
-                    Ok(series.items)
-                }
-                Err(e) => {
-                    Err(anyhow!(format!("error deserializing data {}: {}", e, String::from_utf8_lossy(&resp_body))).into())
-                }
-            }
-        } else {
-            Err(anyhow!(format!("error getting data {}: {}", resp_status.as_str(), String::from_utf8_lossy(&resp_body))).into())
-        }
+        self.fetch_emby_items("Items?Recursive=true&IncludeItemTypes=Movie&SortBy=SortName").await
     }
 
     async fn get_users(&self) -> Result<Vec<EmbyItemData>, Error> {
-        let url = "Users/Query";
-        let resp = self.do_emby_get(&url).await?;
-        let resp_status = resp.status();
-        let resp_body = resp.bytes().await?;
-        if resp_status.clone().is_success() {
-            match serde_json::from_slice::<EmbyItemsResult>(&resp_body) {
-                Ok(series) => {
-                    Ok(series.items)
-                }
-                Err(e) => {
-                    Err(anyhow!(format!("error deserializing user data {}: {}", e, String::from_utf8_lossy(&resp_body))).into())
-                }
-            }
-        } else {
-            Err(anyhow!(format!("error getting user data {}: {}", resp_status.as_str(), String::from_utf8_lossy(&resp_body))).into())
-        }
+        self.fetch_emby_items("Users/Query").await
     }
 
     async fn get_user_by_id(&self, user_id: String) -> Result<EmbyItemData, Error> {
@@ -297,11 +244,11 @@ impl EmbySearch for EmbyClient {
                     Ok(user)
                 }
                 Err(e) => {
-                    Err(anyhow!(format!("error deserializing user data {}: {}", e, String::from_utf8_lossy(&resp_body))).into())
+                    Err(anyhow!("error deserializing user data {}: {}", e, String::from_utf8_lossy(&resp_body)))
                 }
             }
         } else {
-            Err(anyhow!(format!("error getting user data {}: {}", resp_status.as_str(), String::from_utf8_lossy(&resp_body))).into())
+            Err(anyhow!("error getting user data {}: {}", resp_status.as_str(), String::from_utf8_lossy(&resp_body)))
         }
     }
 
@@ -309,8 +256,21 @@ impl EmbySearch for EmbyClient {
         let emby_client = self.clone();
         Arc::new(TokioMutex::new(Box::pin(async move {
                 let url = format!("Users/{user_id}/PlayedItems/{media_id}");
-                let _resp = emby_client.do_emby_post(&url).await;
-                true
+                match emby_client.do_emby_post(&url).await {
+                    Ok(resp) => {
+                        if resp.status().is_success() {
+                            info!("Successfully marked item {} as played for user {}", media_id, user_id);
+                            true
+                        } else {
+                            error!("Failed to mark item {} as played: status {}", media_id, resp.status());
+                            false
+                        }
+                    }
+                    Err(e) => {
+                        error!("Error marking item {} as played: {}", media_id, e);
+                        false
+                    }
+                }
         }) as Pin<Box<dyn Future<Output = bool> + Send>>))
     }
 }
@@ -404,4 +364,121 @@ where
     }
 
     deserializer.deserialize_any(OptionStringOrIntVisitor)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_deserialize_emby_item_with_string_id() {
+        let json = r#"{
+            "Id": "abc123",
+            "Name": "Test Show",
+            "Type": "Series"
+        }"#;
+        let item: EmbyItemData = serde_json::from_str(json).unwrap();
+        assert_eq!(item.id, "abc123");
+        assert_eq!(item.name, "Test Show");
+        assert_eq!(item.item_type, Some("Series".to_string()));
+    }
+
+    #[test]
+    fn test_deserialize_emby_item_with_int_id() {
+        let json = r#"{
+            "Id": 12345,
+            "Name": "Test Movie",
+            "Type": "Movie"
+        }"#;
+        let item: EmbyItemData = serde_json::from_str(json).unwrap();
+        assert_eq!(item.id, "12345");
+        assert_eq!(item.name, "Test Movie");
+        assert_eq!(item.item_type, Some("Movie".to_string()));
+    }
+
+    #[test]
+    fn test_deserialize_emby_item_with_episode_numbers() {
+        let json = r#"{
+            "Id": "ep1",
+            "Name": "Pilot",
+            "Type": "Episode",
+            "IndexNumber": 1,
+            "ParentIndexNumber": 1,
+            "Path": "/media/shows/pilot.mkv"
+        }"#;
+        let item: EmbyItemData = serde_json::from_str(json).unwrap();
+        assert_eq!(item.episode_num, Some("1".to_string()));
+        assert_eq!(item.season_num, Some("1".to_string()));
+        assert_eq!(item.path, Some("/media/shows/pilot.mkv".to_string()));
+    }
+
+    #[test]
+    fn test_deserialize_emby_item_with_string_episode_numbers() {
+        let json = r#"{
+            "Id": "ep1",
+            "Name": "Pilot",
+            "IndexNumber": "5",
+            "ParentIndexNumber": "2"
+        }"#;
+        let item: EmbyItemData = serde_json::from_str(json).unwrap();
+        assert_eq!(item.episode_num, Some("5".to_string()));
+        assert_eq!(item.season_num, Some("2".to_string()));
+    }
+
+    #[test]
+    fn test_deserialize_emby_item_with_user_data() {
+        let json = r#"{
+            "Id": "123",
+            "Name": "Watched Episode",
+            "UserData": {
+                "Played": true
+            }
+        }"#;
+        let item: EmbyItemData = serde_json::from_str(json).unwrap();
+        assert!(item.user_data.is_some());
+        assert!(item.user_data.unwrap().played);
+    }
+
+    #[test]
+    fn test_deserialize_emby_item_minimal() {
+        let json = r#"{
+            "Id": "min1",
+            "Name": "Minimal Item"
+        }"#;
+        let item: EmbyItemData = serde_json::from_str(json).unwrap();
+        assert_eq!(item.id, "min1");
+        assert_eq!(item.name, "Minimal Item");
+        assert!(item.item_type.is_none());
+        assert!(item.path.is_none());
+        assert!(item.episode_num.is_none());
+        assert!(item.season_num.is_none());
+        assert!(item.user_data.is_none());
+    }
+
+    #[test]
+    fn test_emby_items_result_sorting() {
+        let json = r#"{
+            "Items": [
+                {"Id": "3", "Name": "Episode 10", "IndexNumber": 10},
+                {"Id": "1", "Name": "Episode 1", "IndexNumber": 1},
+                {"Id": "2", "Name": "Episode 5", "IndexNumber": 5}
+            ]
+        }"#;
+        let result: EmbyItemsResult = serde_json::from_str(json).unwrap();
+        let sorted = result.get_sorted_items();
+        assert_eq!(sorted[0].name, "Episode 1");
+        assert_eq!(sorted[1].name, "Episode 5");
+        assert_eq!(sorted[2].name, "Episode 10");
+    }
+
+    #[test]
+    fn test_search_item_type_from_str() {
+        use std::str::FromStr;
+        assert!(SearchItemType::from_str("Series").is_ok());
+        assert!(SearchItemType::from_str("series").is_ok());
+        assert!(SearchItemType::from_str("SERIES").is_ok());
+        assert!(SearchItemType::from_str("Movie").is_ok());
+        assert!(SearchItemType::from_str("movie").is_ok());
+        assert!(SearchItemType::from_str("Invalid").is_err());
+    }
 }

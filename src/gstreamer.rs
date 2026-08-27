@@ -18,11 +18,18 @@ use gst_pbutils::{prelude::*, ElementPropertiesMapItem};
 use uuid::Uuid;
 use tracing::{error, info};
 
+/// Type alias for the stop function callback
+type StopFn = Option<Arc<TokioMutex<Pin<Box<dyn Future<Output = bool> + Send>>>>>;
 
-
+/// Buffer size for uridecodebin in bytes (10 MB)
+const BUFFER_SIZE: i32 = 10 * 1024 * 1024;
+/// Video encoder bitrate in kbps
+const VIDEO_BITRATE: u32 = 3000;
+/// Video encoder quantizer value (lower = better quality, larger file)
+const VIDEO_QUANTIZER: u32 = 21;
 
 #[derive(Debug, Display, Error)]
-#[display(fmt = "Received error from {src}: {error} (debug: {debug:?})")]
+#[display("Received error from {src}: {error} (debug: {debug:?})")]
 struct ErrorMessage {
     src: glib::GString,
     error: glib::Error,
@@ -37,37 +44,47 @@ fn get_value_or_error<T>(option: Option<T>, error: &str) -> Result<T, Error> {
     option.ok_or_else(|| anyhow!("{}", error))
 }
 
+pub(crate) struct PipelineBundle {
+    pipeline: gst::Pipeline,
+    audio_selector: gst::Element,
+    text_selector: gst::Element,
+    subtitleoverlay: gst::Element,
+    audio_selector_pads: Arc<Mutex<Vec<gst::Pad>>>,
+    text_selector_pads: Arc<Mutex<Vec<gst::Pad>>>,
+}
+
 #[derive(Clone)]
 pub(crate) struct QueueItem {
     display_name: String,
     uri: Url,
-    stop_fn: Option<Arc<TokioMutex<Pin<Box<dyn Future<Output = bool> + Send>>>>>,
+    stop_fn: StopFn,
     id: Uuid,
 }
 
 impl QueueItem {
-    pub fn new(display_name: String, uri: Url, stop_fn: Option<Arc<TokioMutex<Pin<Box<dyn Future<Output = bool> + Send>>>>>) -> Self {
+    pub fn new(display_name: String, uri: Url, stop_fn: StopFn) -> Self {
         QueueItem {
-            display_name: display_name,
-            uri: uri,
+            display_name,
+            uri,
             id: Uuid::new_v4(),
-            stop_fn: stop_fn,
+            stop_fn,
         }
     }
 
     pub fn name(&self) -> String {
         self.display_name.clone()
     }
-    
+
     pub fn uri(&self) -> Url {
         self.uri.clone()
     }
 
     pub fn id(&self) -> Uuid {
-        self.id.clone()
+        self.id
     }
 
 
+    #[allow(clippy::let_and_return)]
     pub async fn run_stop_fn(&self) -> bool {
         match &self.stop_fn {
             Some(func) => {
@@ -78,27 +95,33 @@ impl QueueItem {
             None => false,
         }
     }
-    
+
 }
 
 pub(crate) struct PlayQueue {
     pipeline: gst::Pipeline,
     uris: VecDeque<QueueItem>,
     current_item: Option<QueueItem>,
+    audio_selector: gst::Element,
+    text_selector: gst::Element,
+    subtitleoverlay: gst::Element,
+    audio_selector_pads: Arc<Mutex<Vec<gst::Pad>>>,
+    text_selector_pads: Arc<Mutex<Vec<gst::Pad>>>,
 }
 
 impl PlayQueue {
     pub fn new(rtmp_host: &str) -> Result<Self, Error> {
-        let pipeline = get_rtmp_pipeline(rtmp_host)?;
-        // Initialize and add necessary elements to the pipeline
-
-        Ok(
-            Self {
-               pipeline,
-               uris: VecDeque::new(),
-               current_item: None,
-            }
-        )
+        let bundle = get_rtmp_pipeline(rtmp_host)?;
+        Ok(Self {
+            pipeline: bundle.pipeline,
+            uris: VecDeque::new(),
+            current_item: None,
+            audio_selector: bundle.audio_selector,
+            text_selector: bundle.text_selector,
+            subtitleoverlay: bundle.subtitleoverlay,
+            audio_selector_pads: bundle.audio_selector_pads,
+            text_selector_pads: bundle.text_selector_pads,
+        })
     }
 
     pub async fn add_eos_watch(play_queue: &Arc<tokio::sync::Mutex<Self>>) {
@@ -107,7 +130,13 @@ impl PlayQueue {
             playqueue.pipeline.clone()
         };
 
-        let bus = pipeline.bus().unwrap();
+        let bus = match pipeline.bus() {
+            Some(bus) => bus,
+            None => {
+                error!("Failed to get pipeline bus for EOS watch");
+                return;
+            }
+        };
         let playqueue_clone = Arc::clone(play_queue);
 
         let mut messages = bus.stream();
@@ -119,23 +148,37 @@ impl PlayQueue {
                         Ok(_) => (),
                         Err(e) => error!("{}", e)
                     };
-                    ()
-                },
-                _ => (),
+                }
+                MessageView::Error(err) => {
+                    error!(
+                        "Pipeline error from {:?}: {} ({:?})",
+                        err.src().map(|s| s.path_string()),
+                        err.error(),
+                        err.debug()
+                    );
+                    match playqueue_clone.lock().await.stop_playback().await {
+                        Ok(_) => (),
+                        Err(e) => error!("Failed to stop pipeline after error: {}", e)
+                    };
+                }
+                _ => ()
             }
         }
     }
 
     // Function to add a URI to the queue
-    pub fn add_uri(&mut self, uri: String, display_name: String, stop_fn: Option<Arc<TokioMutex<Pin<Box<dyn Future<Output = bool> + Send>>>>>) -> Result<QueueItem, Error> {
-        let queue_uri: String;
-        if uri.starts_with("/") {
+    pub fn add_uri(&mut self, uri: String, display_name: String, stop_fn: StopFn) -> Result<QueueItem, Error> {
+        let queue_uri: String = if uri.starts_with('/') {
             let path = Path::new(&uri);
-            queue_uri = Url::from_file_path(path).unwrap().to_string();
+            Url::from_file_path(path)
+                .map_err(|_| anyhow!("Failed to convert file path to URL: {}", uri))?
+                .to_string()
         } else {
-            queue_uri = uri;
-        }
-        let queue_item = QueueItem::new(display_name, Url::parse(&queue_uri).unwrap(), stop_fn);
+            uri
+        };
+        let parsed_url = Url::parse(&queue_uri)
+            .map_err(|e| anyhow!("Failed to parse URI '{}': {}", queue_uri, e))?;
+        let queue_item = QueueItem::new(display_name, parsed_url, stop_fn);
         self.uris.push_back(queue_item.clone());
         Ok(queue_item)
     }
@@ -193,15 +236,34 @@ impl PlayQueue {
         Ok(self.current_item.clone())
     }
 
+    fn reset_track_pads(&mut self) {
+        {
+            let mut audio_pads = self.audio_selector_pads.lock().unwrap();
+            for pad in audio_pads.drain(..) {
+                self.audio_selector.release_request_pad(&pad);
+            }
+        }
+        {
+            let mut text_pads = self.text_selector_pads.lock().unwrap();
+            for pad in text_pads.drain(..) {
+                self.text_selector.release_request_pad(&pad);
+            }
+        }
+        self.subtitleoverlay.set_property("silent", true);
+    }
+
     pub async fn stop_playback(&mut self) -> Result<(), Error> {
         match self.pipeline.current_state() {
             gst::State::Playing|gst::State::Paused|gst::State::Ready => {
-                stop_pipeline(&self.pipeline)?;
-                match &self.current_item {
-                    Some(i) => {i.run_stop_fn().await; ()},
-                    None => (),
+                self.reset_track_pads();
+                // Capture the result but do cleanup first — if stop_pipeline fails we still
+                // want current_item cleared so PlayQueue's state stays consistent.
+                let stop_result = stop_pipeline(&self.pipeline);
+                if let Some(i) = &self.current_item {
+                    let _ = i.run_stop_fn().await;
                 }
                 self.current_item = None;
+                stop_result?;
             }
             _ => {
             }
@@ -246,6 +308,100 @@ impl PlayQueue {
         }
     }
 
+    /// Returns the list of available audio tracks as human-readable names.
+    /// Empty if no audio tracks have been discovered yet (pipeline stopped or audio-less source).
+    pub fn get_audio_tracks(&self) -> Vec<String> {
+        let pads = self.audio_selector_pads.lock().unwrap();
+        pads.iter().enumerate().map(|(i, _)| format!("Audio {}", i + 1)).collect()
+    }
+
+    /// Returns available subtitle tracks. Index 0 is always "No Subtitles".
+    /// Indices 1..N correspond to discovered subtitle streams.
+    pub fn get_text_tracks(&self) -> Vec<String> {
+        let pads = self.text_selector_pads.lock().unwrap();
+        let mut v = vec!["No Subtitles".to_string()];
+        v.extend((0..pads.len()).map(|i| format!("Subtitle {}", i + 1)));
+        v
+    }
+
+    /// Switch to the audio track at the given index (0-based into get_audio_tracks()).
+    pub fn select_audio_track(&self, index: usize) -> Result<(), Error> {
+        let pad = {
+            let pads = self.audio_selector_pads.lock().unwrap();
+            pads.get(index)
+                .ok_or_else(|| anyhow!("audio track index {} out of range (have {})", index, pads.len()))?
+                .clone()
+        };
+        self.audio_selector.set_property("active-pad", &pad);
+        Ok(())
+    }
+
+    /// Select a subtitle track. index 0 = disable subtitles; index 1..N = subtitle track N-1.
+    /// Links text_selector → subtitleoverlay the first time a subtitle track is chosen.
+    pub fn select_text_track(&self, index: usize) -> Result<(), Error> {
+        if index == 0 {
+            self.subtitleoverlay.set_property("silent", true);
+            return Ok(());
+        }
+        let track_index = index - 1;
+        // Clone the pad so we can drop the lock before calling into GStreamer.
+        let pad = {
+            let pads = self.text_selector_pads.lock().unwrap();
+            pads.get(track_index)
+                .ok_or_else(|| anyhow!("subtitle track index {} out of range (have {})", track_index, pads.len()))?
+                .clone()
+        };
+
+        // Lazily link text_selector.src → subtitleoverlay.subtitle_sink the first time.
+        // Must be done BEFORE setting active-pad so that the STREAM_START/CAPS/SEGMENT
+        // events emitted by input-selector flow through to subtitleoverlay immediately.
+        // If active-pad is set while src is unlinked, those events go nowhere and are
+        // not re-sent when the link is subsequently made — subtitleoverlay never gets
+        // SEGMENT, can't sync subtitles, and silently discards them on first enable.
+        let text_sel_src = get_value_or_error(
+            self.text_selector.static_pad("src"),
+            "failed to get text_selector src pad",
+        )?;
+        if !text_sel_src.is_linked() {
+            let subtitle_sink = get_value_or_error(
+                self.subtitleoverlay.static_pad("subtitle_sink"),
+                "failed to get subtitleoverlay subtitle_sink pad",
+            )?;
+            text_sel_src.link(&subtitle_sink)?;
+        }
+
+        // Set active-pad after the link is in place so stream events reach subtitleoverlay.
+        self.text_selector.set_property("active-pad", &pad);
+        self.subtitleoverlay.set_property("silent", false);
+        Ok(())
+    }
+
+    /// Returns the 0-based index of the currently active audio track, or None if no track is active.
+    pub fn get_current_audio_track_index(&self) -> Option<usize> {
+        let active: Option<gst::Pad> = self.audio_selector.property("active-pad");
+        let active = active?;
+        let pads = self.audio_selector_pads.lock().unwrap();
+        pads.iter().position(|p| p == &active)
+    }
+
+    /// Returns the index of the currently active subtitle track using the same indexing as
+    /// get_text_tracks(): 0 = subtitles disabled, 1..N = subtitle track N-1.
+    pub fn get_current_text_track_index(&self) -> usize {
+        let silent: bool = self.subtitleoverlay.property("silent");
+        if silent {
+            return 0;
+        }
+        let active: Option<gst::Pad> = self.text_selector.property("active-pad");
+        let active = match active {
+            Some(p) => p,
+            None => return 0,
+        };
+        let pads = self.text_selector_pads.lock().unwrap();
+        pads.iter().position(|p| p == &active)
+            .map(|i| i + 1) // +1 because index 0 = "No Subtitles"
+            .unwrap_or(0)
+    }
+
     // More functions for controlling playback and handling EOS, etc.
 }
 
@@ -263,12 +419,12 @@ fn configure_encodebin_rtmp(encodebin: &gst::Element) {
             .presence(0)
             .build();
 
-    
+
     let encoder_props = gst_pbutils::ElementProperties::builder_map().item(
         ElementPropertiesMapItem::builder("x264enc")
             .field("pass", 5)
-            .field("quantizer", 21)
-            .field("bitrate", 3000)
+            .field("quantizer", VIDEO_QUANTIZER)
+            .field("bitrate", VIDEO_BITRATE)
             .build()
     ).build();
     let videocaps = gst_video::VideoCapsBuilder::for_encoding("video/x-h264").build();
@@ -279,7 +435,7 @@ fn configure_encodebin_rtmp(encodebin: &gst::Element) {
             .element_properties(encoder_props)
             .preset_name("x264enc")
             .build();
-    
+
     let contianer_props = gst_pbutils::ElementProperties::builder_general().field("streamable", true).build();
     let container_profile = gst_pbutils::EncodingContainerProfile::builder(
         &gst::Caps::builder("video/x-flv").build(),
@@ -341,11 +497,14 @@ pub(crate) fn seek_pipeline(pipeline: &Pipeline, seek_seconds: i64) -> Result<u6
 
     src_element.seek_simple(seek_flags, gst::ClockTime::from_seconds(new_pos))?;
 
-    return Ok(new_pos)
+    Ok(new_pos)
 }
 
 pub(crate) fn stop_pipeline(pipeline: &Pipeline) -> Result<(), Error> {
-    pipeline.set_state(gst::State::Ready)?;
+    // set_state(Ready) flushes queued buffers but may fail when elements are in error state
+    // (e.g. broken RTMP socket means flush events can't propagate downstream). Ignore the
+    // result and always proceed to Null, which forces all elements to release resources.
+    let _ = pipeline.set_state(gst::State::Ready);
     pipeline.set_state(gst::State::Null)?;
     Ok(())
 }
@@ -365,21 +524,30 @@ pub(crate) fn set_source_uri(pipeline: &Pipeline, uri_path: &str) -> Result<(), 
     Ok(())
 }
 
-pub(crate) fn get_rtmp_pipeline(rtmp_host: &str) -> Result<Pipeline, Error>  {
+pub(crate) fn get_rtmp_pipeline(rtmp_host: &str) -> Result<PipelineBundle, Error>  {
 
     gst::init()?;
 
     let audio_queue = gst::ElementFactory::make("queue").build()?;
 
-    let video_queue = gst::ElementFactory::make("queue").build()?;
+    // Small frame limit so subtitle state changes (silent toggle, track switch) are visible
+    // within ~400ms without needing a flush seek. Byte/time limits disabled; only frame count
+    // matters. x264enc encodes well above real-time so 10 frames of back-pressure tolerance is fine.
+    let video_queue = gst::ElementFactory::make("queue")
+        .property("max-size-buffers", 10u32)
+        .property("max-size-bytes", 0u32)
+        .property("max-size-time", 0u64)
+        .build()?;
     let video_convert = gst::ElementFactory::make("videoconvert").build()?;
     let video_scale = gst::ElementFactory::make("videoscale").build()?;
     let audio_convert = gst::ElementFactory::make("audioconvert").build()?;
     let audio_resample = gst::ElementFactory::make("audioresample").build()?;
     let suboverlay = gst::ElementFactory::make("subtitleoverlay").build()?;
+    let audio_selector = gst::ElementFactory::make("input-selector").build()?;
+    let text_selector = gst::ElementFactory::make("input-selector").build()?;
 
     let encodebin = gst::ElementFactory::make("encodebin").build()?;
-    let sink = gst::ElementFactory::make("rtmpsink").property("location", &rtmp_host).build()?;
+    let sink = gst::ElementFactory::make("rtmpsink").property("location", rtmp_host).build()?;
 
 
     let pipeline = gst::Pipeline::default();
@@ -387,10 +555,12 @@ pub(crate) fn get_rtmp_pipeline(rtmp_host: &str) -> Result<Pipeline, Error>  {
     pipeline.add_many([&video_queue, &audio_queue])?;
     pipeline.add_many([&video_convert, &video_scale, &audio_convert, &audio_resample])?;
     pipeline.add(&suboverlay)?;
+    pipeline.add_many([&audio_selector, &text_selector])?;
 
     gst::Element::link_many([&encodebin, &sink])?;
     gst::Element::link_many([&suboverlay, &video_queue, &video_convert, &video_scale])?;
-    gst::Element::link_many([&audio_queue, &audio_convert, &audio_resample])?;
+    // audio_selector feeds into audio_queue (text_selector is linked lazily on first subtitle selection)
+    gst::Element::link_many([&audio_selector, &audio_queue, &audio_convert, &audio_resample])?;
 
     configure_encodebin_rtmp(&encodebin);
 
@@ -398,50 +568,106 @@ pub(crate) fn get_rtmp_pipeline(rtmp_host: &str) -> Result<Pipeline, Error>  {
     let sink_video_encode_pad = get_value_or_error(encodebin.request_pad_simple("video_%u"), "unable to get video sink from encodebin")?;
 
     // link the end of the chain to the encoder
-    audio_resample.static_pad("src").unwrap().link(&sink_audio_encode_pad)?;
-    video_scale.static_pad("src").unwrap().link(&sink_video_encode_pad)?;
+    let audio_src_pad = get_value_or_error(audio_resample.static_pad("src"), "failed to get audio_resample src pad")?;
+    let video_src_pad = get_value_or_error(video_scale.static_pad("src"), "failed to get video_scale src pad")?;
+    audio_src_pad.link(&sink_audio_encode_pad)?;
+    video_src_pad.link(&sink_video_encode_pad)?;
 
     let video_sink_real = get_value_or_error(suboverlay.static_pad("video_sink"), "failed to get video sink for uridecode")?;
-    let subtitle_sink_real = get_value_or_error(suboverlay.static_pad("subtitle_sink"), "filed to get subtitle sink for uridecode")?;
-    let audio_sink_real = get_value_or_error(audio_queue.static_pad("sink"), "failed to get audio sink for uridecode")?;
+
+    // Subtitles start disabled; text_selector → subtitleoverlay link is created lazily on first use
+    suboverlay.set_property("silent", true);
 
     let uridecode = gst::ElementFactory::make("uridecodebin")
         .name("src")
         .property("force-sw-decoders", true)
         .property("use-buffering", true)
-        .property("buffer-size", 10 * 1024 * 1024)
+        .property("buffer-size", BUFFER_SIZE)
         .build()?;
 
     pipeline.add(&uridecode)?;
 
+    let audio_selector_pads: Arc<Mutex<Vec<gst::Pad>>> = Arc::new(Mutex::new(Vec::new()));
+    let text_selector_pads: Arc<Mutex<Vec<gst::Pad>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let audio_sel_c = audio_selector.clone();
+    let text_sel_c = text_selector.clone();
+    let audio_pads_c = Arc::clone(&audio_selector_pads);
+    let text_pads_c = Arc::clone(&text_selector_pads);
 
     uridecode.connect_pad_added(move |_src, src_pad| {
-        let pad_caps = src_pad.current_caps().unwrap();
-        let pad_struct = pad_caps.structure(0).unwrap();
+        let pad_caps = match src_pad.current_caps() {
+            Some(caps) => caps,
+            None => {
+                error!("Failed to get current caps for pad");
+                return;
+            }
+        };
+        let pad_struct = match pad_caps.structure(0) {
+            Some(s) => s,
+            None => {
+                error!("Failed to get structure from pad caps");
+                return;
+            }
+        };
         let pad_type = pad_struct.name();
+
         if pad_type.starts_with("video/x-raw") {
             if video_sink_real.is_linked() {
                 info!("video sink is already linked!");
                 return;
             }
-            src_pad.link(&video_sink_real).unwrap();
+            if let Err(e) = src_pad.link(&video_sink_real) {
+                error!("Failed to link video pad: {:?}", e);
+            }
+            return;
         }
+
         if pad_type.starts_with("audio/x-raw") {
-            if audio_sink_real.is_linked() {
-                info!("audio sink is already linked!");
+            let selector_sink = match audio_sel_c.request_pad_simple("sink_%u") {
+                Some(p) => p,
+                None => {
+                    error!("failed to request audio selector sink pad");
+                    return;
+                }
+            };
+            if let Err(e) = src_pad.link(&selector_sink) {
+                error!("Failed to link audio pad to selector: {:?}", e);
                 return;
             }
-            src_pad.link(&audio_sink_real).unwrap();
+            let mut pads = audio_pads_c.lock().unwrap();
+            if pads.is_empty() {
+                // First audio pad: make it active so audio plays immediately
+                audio_sel_c.set_property("active-pad", &selector_sink);
+            }
+            pads.push(selector_sink);
+            return;
         }
+
         if pad_type.starts_with("text/x-raw") {
-            if subtitle_sink_real.is_linked() {
-                info!("subtitle sink is already linked!");
+            let selector_sink = match text_sel_c.request_pad_simple("sink_%u") {
+                Some(p) => p,
+                None => {
+                    error!("failed to request text selector sink pad");
+                    return;
+                }
+            };
+            if let Err(e) = src_pad.link(&selector_sink) {
+                error!("Failed to link text pad to selector: {:?}", e);
                 return;
             }
-            src_pad.link(&subtitle_sink_real).unwrap();
+            let mut pads = text_pads_c.lock().unwrap();
+            // Do not activate or un-silence here; user opts in via select_text_track()
+            pads.push(selector_sink);
         }
     });
 
-    Ok(pipeline)
+    Ok(PipelineBundle {
+        pipeline,
+        audio_selector,
+        text_selector,
+        subtitleoverlay: suboverlay,
+        audio_selector_pads,
+        text_selector_pads,
+    })
 }
- 

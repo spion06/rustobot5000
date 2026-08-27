@@ -12,12 +12,13 @@ pub(crate) async fn rusto_gameadmin(_: Context<'_>) -> Result<(), Error> {
 async fn validate_game_name(ctx: Context<'_>, game: String) -> Result<(), Error> {
     match ctx.data().get_deployment_client().await {
         Ok(client) => {
-            if get_valid_deployments(client).await.unwrap().contains(&game) {
+            let valid_deployments = get_valid_deployments(client).await?;
+            if valid_deployments.contains(&game) {
                 info!("{game} is a valid game name");
-                return Ok(())
+                Ok(())
             } else {
                 info!("{game} is not a valid game name");
-                return Err(Box::new(BotError::new(&format!("{game} is not a valid game name"))))
+                Err(Box::new(BotError::new(&format!("{game} is not a valid game name"))))
             }
         },
         Err(e) => Err(e)
@@ -55,12 +56,12 @@ async fn restart(
             restart_deployment(client.clone(), game.clone()).await?;
             ctx.say(format!("Started restart on {game}")).await?;
             ctx.say("Check status with game_status command").await?;
-            return Ok(())
+            Ok(())
         },
         Err(e) => {
             let err_msg = format!("Error getting client: {e}");
             error!("{err_msg}");
-            return Err(e)
+            Err(e)
         }
     }
 }
@@ -72,8 +73,9 @@ async fn get_deployment_pods(
     let dep_client: Api<Deployment> = Api::default_namespaced(client.clone());
     let pod_client: Api<Pod> = Api::default_namespaced(client);
     let deployment = dep_client.get(&deployment_name).await?;
-    let pod_match_labels = deployment.spec.unwrap().selector.match_labels.unwrap();
-    let selector_query = pod_match_labels.iter()
+    let spec = deployment.spec.ok_or_else(|| Box::new(BotError::new(&format!("Deployment {} has no spec", deployment_name))))?;
+    let match_labels = spec.selector.match_labels.ok_or_else(|| Box::new(BotError::new(&format!("Deployment {} has no match labels", deployment_name))))?;
+    let selector_query = match_labels.iter()
         .map(|(key, value)| format!("{}={}", key, value))
         .collect::<Vec<_>>()
         .join(",");
@@ -93,7 +95,13 @@ async fn status(
         Ok(kclient) => {
             let d_client: Api<Deployment> = Api::default_namespaced(kclient.clone());
             let resp = d_client.get_status(&game).await?;
-            let status = resp.status.expect("somehow there is no deployment status");
+            let status = match resp.status {
+                Some(s) => s,
+                None => {
+                    ctx.say(format!("No status available for deployment {game}")).await?;
+                    return Ok(());
+                }
+            };
             let total_replicas = status.replicas.unwrap_or_else(|| {
                 warn!("total_replicas not found found for {game}");
                 0
@@ -105,7 +113,9 @@ async fn status(
             let pods = get_deployment_pods(kclient, game.clone()).await?;
             ctx.say(format!("{ready_replicas}/{total_replicas} ready for game {game}")).await?;
             for pod in pods {
-                let pod_status = pod.status.expect("pod has no status somehow").phase.unwrap_or("unknown".to_string());
+                let pod_status = pod.status
+                    .and_then(|s| s.phase)
+                    .unwrap_or_else(|| "unknown".to_string());
                 ctx.say(format!("Pod in status: {pod_status} ")).await?;
             }
             Ok(())
@@ -133,12 +143,19 @@ async fn logs(
             let pod_client: Api<Pod> = Api::default_namespaced(kclient.clone());
             let tail_lines = lines.unwrap_or(10).min(100);
             for pod in pods {
+                let pod_name = match &pod.metadata.name {
+                    Some(name) => name.clone(),
+                    None => {
+                        warn!("Pod has no name, skipping");
+                        continue;
+                    }
+                };
                 let log_params = LogParams {
                     tail_lines: Some(tail_lines),
                     ..LogParams::default()
                 };
                 info!("getting last {tail_lines} lines from {game}");
-                let pod_logs = pod_client.logs(&pod.metadata.name.unwrap(), &log_params).await?;
+                let pod_logs = pod_client.logs(&pod_name, &log_params).await?;
                 let attachment_name = format!("{game}.log");
                 let attachment_logs = CreateAttachment::bytes(pod_logs.as_bytes(), attachment_name);
                 ctx.send(CreateReply::default().attachment(attachment_logs)).await?;
@@ -158,10 +175,14 @@ async fn get_valid_deployments(
     let list_req = ListParams::default().labels("rustobot5000.managed=true");
     let mut deployment_list: Vec<String> = Vec::new();
     for dep in api.list(&list_req).await? {
-        deployment_list.push(dep.metadata.name.expect("somehow deployment has no metadata.name"))
+        if let Some(name) = dep.metadata.name {
+            deployment_list.push(name);
+        } else {
+            warn!("Found deployment without a name, skipping");
+        }
     }
 
-    return Ok(deployment_list);
+    Ok(deployment_list)
 }
 
 async fn restart_deployment(

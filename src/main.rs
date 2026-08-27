@@ -4,7 +4,6 @@ use kube::{Api, Client as KubeClient};
 use poise::{samples::HelpConfiguration, serenity_prelude::{self as serenity, CreateSelectMenuKind, CreateSelectMenuOption}, FrameworkError};
 use std::{fmt, sync::Arc};
 use tracing::{info, error};
-use tracing_subscriber;
 use tokio::{signal::unix::{signal, SignalKind}, sync::{Mutex, MutexGuard}};
 mod gstreamer;
 mod embyclient;
@@ -37,10 +36,7 @@ impl EmbySearchResult {
         serenity::CreateSelectMenuKind::String { options: self.result_menu_option.clone()}
     }
     pub fn to_msg(&self, result_type: Option<&str>) -> String {
-        let type_name = match result_type {
-            Some(t) => t,
-            None => "items",
-        };
+        let type_name = result_type.unwrap_or("items");
         format!("found {} {}", self.result_items, type_name)
     }
 }
@@ -58,27 +54,37 @@ impl fmt::Display for BotError {
 }
 
 fn bot_error(msg: &str) -> Error {
-    return Box::new(BotError::new(msg))
+    Box::new(BotError::new(msg))
 }
 
 impl std::error::Error for BotError {}
 
+/// Path remapping configuration for translating Emby paths to local paths
+#[derive(Clone)]
+pub(crate) struct PathRemap {
+    pub from: String,
+    pub to: String,
+}
+
 struct Data {
     video_pipeline: Arc<Mutex<PlayQueue>>,
     emby_client: Arc<EmbyClient>,
+    path_remap: Option<PathRemap>,
 } // User data, which is stored and accessible in all command invocations
 impl Data {
-    pub async fn load(_ctx: &serenity::Context, video_pipeline: Arc<Mutex<PlayQueue>>, emby_client: EmbyClient) -> Self {
+    pub async fn load(_ctx: &serenity::Context, video_pipeline: Arc<Mutex<PlayQueue>>, emby_client: EmbyClient, path_remap: Option<PathRemap>) -> Self {
         Self {
-            video_pipeline: video_pipeline,
+            video_pipeline,
             emby_client: Arc::new(emby_client),
+            path_remap,
         }
     }
 
-    fn clone(&self) -> Data {
-        Data {
-            video_pipeline: Arc::clone(&self.video_pipeline),
-            emby_client: Arc::clone(&self.emby_client),
+    /// Remap a path using configured path remapping, if any
+    pub fn remap_path(&self, path: &str) -> String {
+        match &self.path_remap {
+            Some(remap) => path.replace(&remap.from, &remap.to),
+            None => path.to_string(),
         }
     }
     async fn get_kube_client(&self) -> Result<KubeClient, Error> {
@@ -170,13 +176,16 @@ async fn on_error(error: poise::FrameworkError<'_, Data, Error>) {
     // They are many errors that can occur, so we only handle the ones we want to customize
     // and forward the rest to the default handler
     match error {
-        poise::FrameworkError::Setup { error, .. } => panic!("Failed to start bot: {:?}", error),
+        poise::FrameworkError::Setup { error, .. } => {
+            error!("Failed to start bot: {:?}", error);
+            std::process::exit(1);
+        },
         poise::FrameworkError::Command { error, ctx, .. } => {
-            println!("Error in command `{}`: {:?}", ctx.command().name, error,);
+            error!("Error in command `{}`: {:?}", ctx.command().name, error);
         }
         error => {
             if let Err(e) = poise::builtins::on_error(error).await {
-                println!("Error while handling error: {}", e)
+                error!("Error while handling error: {}", e)
             }
         }
     }
@@ -188,10 +197,19 @@ async fn main() {
     let default_rtmp_address = "rtmp://localhost:7788/live/livestream";
     let default_emby_url = "http://localhost:8096";
 
-    let token = std::env::var("DISCORD_TOKEN").expect("missing DISCORD_TOKEN");
-    let emby_api_token = std::env::var("EMBY_API_TOKEN").expect("missing EMBY_API_TOKEN");
+    let token = std::env::var("DISCORD_TOKEN").expect("DISCORD_TOKEN environment variable is required");
+    let emby_api_token = std::env::var("EMBY_API_TOKEN").expect("EMBY_API_TOKEN environment variable is required");
     let emby_api_address = std::env::var("EMBY_API_URL").unwrap_or(default_emby_url.to_string());
     let rtmp_dst_address = std::env::var("RTMP_URI").unwrap_or(default_rtmp_address.to_string());
+
+    // Optional path remapping for translating Emby paths to local filesystem paths
+    let path_remap = match (std::env::var("PATH_REMAP_FROM"), std::env::var("PATH_REMAP_TO")) {
+        (Ok(from), Ok(to)) => {
+            info!("Path remapping enabled: '{}' -> '{}'", from, to);
+            Some(PathRemap { from, to })
+        }
+        _ => None,
+    };
 
     let intents = serenity::GatewayIntents::non_privileged();
     // Bind the string to a variable so it isn't dropped immediately
@@ -203,27 +221,49 @@ async fn main() {
         gameserver::rusto_gameadmin(),
         video_commands::rusto_video(),
     ];
-    let play_queue = PlayQueue::new(&rtmp_dst_address).unwrap();
+    let play_queue = match PlayQueue::new(&rtmp_dst_address) {
+        Ok(pq) => pq,
+        Err(e) => {
+            eprintln!("Error: Failed to initialize GStreamer pipeline: {}", e);
+            std::process::exit(1);
+        }
+    };
     let shared_play_queue = Arc::new(Mutex::new(play_queue));
     let main_playqueue = Arc::clone(&shared_play_queue.clone());
     let eos_watch_playqueue = Arc::clone(&shared_play_queue.clone());
     let eos_thread = tokio::spawn(async move {
         PlayQueue::add_eos_watch(&eos_watch_playqueue).await;
     });
-    let emby_client = EmbyClient::new(emby_api_address, emby_api_token).await.unwrap();
+    let emby_client = match EmbyClient::new(emby_api_address, emby_api_token).await {
+        Ok(ec) => ec,
+        Err(e) => {
+            eprintln!("Error: Failed to initialize Emby client: {}", e);
+            std::process::exit(1);
+        }
+    };
     tracing_subscriber::fmt::init();
 
-    let guild_ids: Vec<_> = guild_ids_str.split(",")
-        .map(|f| {
-            f.parse::<u64>()
-             .map(serenity::GuildId::new)
-             .expect("invalid guild id")
+    let guild_ids: Vec<_> = guild_ids_str.split(',')
+        .filter_map(|f| {
+            let trimmed = f.trim();
+            match trimmed.parse::<u64>() {
+                Ok(id) => Some(serenity::GuildId::new(id)),
+                Err(e) => {
+                    error!("Invalid guild ID '{}': {}, skipping", trimmed, e);
+                    None
+                }
+            }
         })
         .collect();
 
+    if guild_ids.is_empty() {
+        eprintln!("Error: No valid guild IDs configured. Set DISCORD_SERVER_IDS environment variable.");
+        std::process::exit(1);
+    }
+
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
-            commands: commands,
+            commands,
             prefix_options: poise::PrefixFrameworkOptions {
                 prefix: Some("~".into()),
                 ..Default::default()
@@ -252,18 +292,41 @@ async fn main() {
                 }
                 let empty_commands = vec![help()];
                 poise::builtins::register_globally(ctx, &empty_commands).await?;
-                Ok(Data::load(ctx, main_playqueue, emby_client).await)
+                Ok(Data::load(ctx, main_playqueue, emby_client, path_remap).await)
             })
         })
         .build();
 
-    let mut client = serenity::ClientBuilder::new(token, intents)
+    let mut client = match serenity::ClientBuilder::new(token, intents)
         .framework(framework)
-        .await
-        .expect("error creating serenity client");
-    let mut ctrl_c = signal(SignalKind::interrupt()).expect("failed to listen for interrupt");
-    let mut sig_term = signal(SignalKind::terminate()).expect("failed to listen for SIGTERM");
-    let mut sig_quit = signal(SignalKind::quit()).expect("failed to listen for SIGQUIT");
+        .await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Error: Failed to create Discord client: {}", e);
+                std::process::exit(1);
+            }
+        };
+    let mut ctrl_c = match signal(SignalKind::interrupt()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error: Failed to listen for SIGINT: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let mut sig_term = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error: Failed to listen for SIGTERM: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let mut sig_quit = match signal(SignalKind::quit()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error: Failed to listen for SIGQUIT: {}", e);
+            std::process::exit(1);
+        }
+    };
     tokio::select! {
         _ = client.start_autosharded() => println!("Client stopped"),
         _ = ctrl_c.recv() => println!("Received Ctrl+C, shutting down..."),

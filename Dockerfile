@@ -1,32 +1,48 @@
-# Stage 1: Build the binary with musl
-FROM rust:latest as builder
+# Stage 1: Build the binary
+FROM rust:latest AS builder
 
-# Add musl target
-RUN rustup target add x86_64-unknown-linux-gnu
-
-# Create a new empty shell project
 WORKDIR /usr/src/rustobot5000
+
+# Install build deps BEFORE copying source — this layer is cached across source changes
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgstreamer1.0-dev \
+    libgstreamer-plugins-base1.0-dev \
+    gstreamer1.0-plugins-base \
+    gstreamer1.0-plugins-good \
+    gstreamer1.0-plugins-bad \
+    gstreamer1.0-plugins-ugly \
+    gstreamer1.0-libav \
+    libgstrtspserver-1.0-dev \
+    libges-1.0-dev \
+    libssl-dev && \
+    rm -rf /var/lib/apt/lists/*
+
 COPY . .
 
-RUN apt-get update && apt-get install musl-tools -y && apt-get -y install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-      gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
-      gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
-      gstreamer1.0-libav libgstrtspserver-1.0-dev libges-1.0-dev && \
-      apt-get -y install libssl-dev
-# Build the binary for musl target
-RUN cargo build --release --target x86_64-unknown-linux-gnu
+# Cache mounts keep the cargo registry and compiled artifacts between builds.
+# The binary is copied out before the RUN ends since cache mounts don't persist in the layer.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/usr/src/rustobot5000/target \
+    cargo build --release --target x86_64-unknown-linux-gnu && \
+    cp target/x86_64-unknown-linux-gnu/release/rustobot5000 /rustobot5000-bin
 
-# Stage 2: Create the final image from scratch
+# Stage 2: Runtime image
 FROM debian:stable-slim
-RUN apt-get update && apt-get upgrade -y && apt-get -y --no-install-recommends install gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
-    gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
-    gstreamer1.0-libav libgstrtspserver-1.0-dev libges-1.0-dev && \
+
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    gstreamer1.0-plugins-base \
+    gstreamer1.0-plugins-good \
+    gstreamer1.0-plugins-bad \
+    gstreamer1.0-plugins-ugly \
+    gstreamer1.0-libav \
+    libgstrtspserver-1.0-0 \
+    libges-1.0-0 && \
     apt-get clean autoclean && \
     apt-get autoremove --yes && \
     rm -rf /var/lib/{apt,dpkg,cache,log}/
 
-# Copy the statically-linked binary from the builder stage
-COPY --from=builder /usr/src/rustobot5000/target/x86_64-unknown-linux-gnu/release/rustobot5000 /rustobot5000
+COPY --from=builder /rustobot5000-bin /rustobot5000
 
-# Command to run when starting the container
 CMD ["/rustobot5000"]
