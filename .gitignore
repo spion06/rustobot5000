@@ -20,3 +20,4 @@ target/
 /target
 *.log
 .aider*
+.claude/
