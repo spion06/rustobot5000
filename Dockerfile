@@ -24,7 +24,7 @@ COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/usr/src/rustobot5000/target \
-    cargo build --release --target x86_64-unknown-linux-gnu && \
+    cargo build --release --locked --target x86_64-unknown-linux-gnu && \
     cp target/x86_64-unknown-linux-gnu/release/rustobot5000 /rustobot5000-bin
 
 # Stage 2: Runtime image
